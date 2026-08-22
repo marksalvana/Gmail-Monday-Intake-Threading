@@ -800,6 +800,24 @@ var LEDGER_HEADERS = ['kind', 'key', 'mondayItemId', 'mailbox', 'threadId',
  * others; Make's ledger holds both shapes. Normalise before using as a key or
  * dedup silently fails on the bracket difference.
  */
+/**
+ * Strip the angle brackets and NOTHING ELSE — case is preserved.
+ *
+ * normalizeMessageId lowercases, which is correct for a dedup KEY (both sides
+ * are flattened, so it matches) and wrong for anything that ends up back in an
+ * RFC 2822 header. Message-ID local parts are case-sensitive, and the outbound
+ * relay puts the ledger's stored value straight into In-Reply-To/References:
+ *   In-Reply-To: <caacrcbgabm3eg3bk8nr0vtwqzid=s-atpowzjpwnnhrop7ykzg@mail...>
+ * against a real id of <CAAcrCBgAbM3Eg3bK8nr0vTwqZid=S-ATPowzJpWnnHrop7YkZg@...>
+ * — so the reply did not join the thread (observed live, 22 Aug).
+ *
+ * Dedup keys keep using normalizeMessageId. Only the stored HEADER VALUE on the
+ * thread-anchor and item rows uses this.
+ */
+function bareMessageId(raw) {
+  return String(raw || '').trim().replace(/^</, '').replace(/>$/, '');
+}
+
 function normalizeMessageId(raw) {
   return String(raw || '')
     .trim()
@@ -932,7 +950,7 @@ function createLedger(adapter) {
         mondayItemId: rec.mondayItemId || '',
         mailbox: rec.mailbox || '',
         threadId: String(rec.threadId || ''),
-        headerMessageId: normalizeMessageId(rec.headerMessageId),
+        headerMessageId: bareMessageId(rec.headerMessageId),
         gmailMessageId: rec.gmailMessageId || '',
         boardId: rec.boardId || '',
         subject: rec.subject || '',
@@ -952,7 +970,7 @@ function createLedger(adapter) {
         mondayItemId: String(rec.mondayItemId || ''),
         mailbox: rec.mailbox || '',
         threadId: rec.threadId || '',
-        headerMessageId: normalizeMessageId(rec.headerMessageId),
+        headerMessageId: bareMessageId(rec.headerMessageId),
         gmailMessageId: rec.gmailMessageId || '',
         boardId: rec.boardId || '',
         subject: rec.subject || '',
@@ -3037,6 +3055,81 @@ function runOutboundDryRun() {
   return summary;
 }
 
+/**
+ * ONE-OFF REPAIR: restore the true case of stored Message-IDs.
+ *
+ * Every ledger row written before 23 Aug holds a lowercased Message-ID, because
+ * the dedup key's normaliser was used for the stored header value too. The
+ * outbound relay puts that value into In-Reply-To/References, and a lowercased
+ * id does not match the real one, so relayed mail starts a new conversation
+ * instead of joining the project thread.
+ *
+ * This re-reads each thread from Gmail and rewrites the header value with the
+ * case Gmail actually has. It touches ONLY the headerMessageId column on
+ * `thread` and `item` rows — never the `key` column, which the dedup index is
+ * built from and which must stay lowercased or every processed email would look
+ * new again.
+ *
+ * Run it once, as the mailbox owner. Safe to re-run: rows already correct are
+ * left alone. Run repairLedgerMessageIdsPreview() first to see what it would do.
+ */
+function repairLedgerMessageIds() { return repairLedgerMessageIds_(false); }
+function repairLedgerMessageIdsPreview() { return repairLedgerMessageIds_(true); }
+
+function repairLedgerMessageIds_(dryRun) {
+  var sh = SpreadsheetApp.openById(LEDGER_SPREADSHEET_ID).getSheetByName(LEDGER_SHEET);
+  if (!sh) { throw new Error('ledger sheet not found'); }
+  var values = sh.getDataRange().getValues();
+  var col = {};
+  values[0].forEach(function (h, i) { col[String(h)] = i; });
+
+  var out = { dryRun: !!dryRun, checked: 0, fixed: 0, alreadyCorrect: 0,
+              noThread: 0, notMine: 0, failed: 0, changes: [] };
+  var cache = {};
+
+  for (var r = 1; r < values.length; r++) {
+    var kind = String(values[r][col.kind]);
+    if (kind !== 'thread' && kind !== 'item') { continue; }
+    var threadId = String(values[r][col.threadId] || '');
+    var stored = String(values[r][col.headerMessageId] || '');
+    if (!threadId || !stored) { out.noThread++; continue; }
+    out.checked++;
+
+    if (!(threadId in cache)) {
+      try {
+        var t = Gmail.Users.Threads.get('me', threadId, {
+          format: 'metadata', metadataHeaders: ['Message-ID']
+        });
+        var first = (t && t.messages && t.messages[0]) || null;
+        var hs = (first && first.payload && first.payload.headers) || [];
+        var found = '';
+        hs.forEach(function (h) {
+          if (String(h.name).toLowerCase() === 'message-id') { found = h.value || ''; }
+        });
+        cache[threadId] = bareMessageId(found);
+      } catch (e) {
+        // A thread that belongs to a different mailbox cannot be read from here.
+        // That is expected once other PMs are live; it is not a failure.
+        cache[threadId] = null;
+      }
+    }
+
+    var real = cache[threadId];
+    if (real === null) { out.notMine++; continue; }
+    if (!real) { out.failed++; continue; }
+    if (real === stored) { out.alreadyCorrect++; continue; }
+
+    out.fixed++;
+    if (out.changes.length < 20) {
+      out.changes.push(kind + ' row ' + (r + 1) + ': ' + stored + '  ->  ' + real);
+    }
+    if (!dryRun) { sh.getRange(r + 1, col.headerMessageId + 1).setValue(real); }
+  }
+
+  console.log(JSON.stringify(out, null, 2));
+  return out;
+}
+
 /** off | self | thread. Unset means off — turning it on must be deliberate. */
 function setBridgeModeOff() { return setBridgeMode_('off'); }
 function setBridgeModeSelf() { return setBridgeMode_('self'); }
@@ -3300,7 +3393,7 @@ var EXPECTED_SYMBOLS = [
   ['20_Classifier.gs', ['classifyMessage']],
   ['30_ColumnValues.gs', ['buildColumnValues']],
   ['35_UpdateBody.gs', ['toMondayDateTime', 'formatUpdateBody', 'escapeHtml']],
-  ['40_Store.gs', ['createLedger', 'normalizeMessageId', 'LEDGER_HEADERS']],
+  ['40_Store.gs', ['createLedger', 'normalizeMessageId', 'bareMessageId', 'LEDGER_HEADERS']],
   ['45_RunLog.gs', ['createRunLog', 'RUNLOG_HEADERS']],
   ['50_SheetAdapter.gs', ['createSheetAdapter']],
   ['55_Migration.gs', ['importMakeLedger', 'previewMakeLedgerImport',
@@ -3314,6 +3407,7 @@ var EXPECTED_SYMBOLS = [
     'mirrorHtml', 'outboundRateGate', 'OUTBOUND_MARKER', 'OUTBOUND_MAX_PER_HOUR']],
   ['90_Entrypoints.gs', ['preflight', 'runShadow', 'runLive',
     'runOutboundOnce', 'runOutboundDryRun', 'outboundStatus', 'setBridgeMode_',
+    'repairLedgerMessageIds', 'repairLedgerMessageIdsPreview',
     'installShadowTrigger', 'installLiveTrigger', 'removeAllTriggers']],
   ['95_WebApp.gs', ['doPost', 'testWebApp']]
 ];

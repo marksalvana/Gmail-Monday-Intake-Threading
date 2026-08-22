@@ -361,4 +361,27 @@ check('skipped updates still advance the cursor — they are decided, not pendin
 });
 
 
+// ================================================================ MESSAGE-ID
+suite('Message-ID case — the difference between a dedup key and a header');
+
+check('bareMessageId strips brackets and preserves case', () => {
+  eq(S.bareMessageId('<CAAcrCBgAbM3Eg3bK8nr0vTwqZid=S-ATPowzJpWnnHrop7YkZg@mail.gmail.com>'),
+     'CAAcrCBgAbM3Eg3bK8nr0vTwqZid=S-ATPowzJpWnnHrop7YkZg@mail.gmail.com');
+  eq(S.bareMessageId('  <a@b.c>  '), 'a@b.c');
+  eq(S.bareMessageId(''), '');
+  eq(S.bareMessageId(null), '');
+});
+
+check('normalizeMessageId still lowercases — dedup keys must not change', () => {
+  eq(S.normalizeMessageId('<AbC@Mail.Gmail.Com>'), 'abc@mail.gmail.com',
+    'every ledger key ever written is lowercased; changing this orphans them all');
+});
+
+check('the two differ exactly where it matters', () => {
+  const real = 'CAAcrCBgAbM3Eg3bK8nr0vTwqZid=S-ATPowzJpWnnHrop7YkZg@mail.gmail.com';
+  truthy(S.normalizeMessageId(real) !== real, 'the key is flattened');
+  eq(S.bareMessageId(real), real, 'the header value is not');
+});
+
+
 report();
