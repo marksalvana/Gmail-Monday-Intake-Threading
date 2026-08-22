@@ -45,6 +45,18 @@
 /** 'internal' | 'client'. THE ONLY LINE THAT DIFFERS BETWEEN THE TWO COPIES. */
 var ROUTE = 'internal';
 
+/**
+ * The mailbox this must run as.
+ *
+ * The project can be OWNED by anyone — a time-based trigger runs as whoever
+ * created it, not as the file's owner. But Gmail calls here are all 'me', so if
+ * a pass ever runs as the wrong person it reads the wrong mailbox: it would find
+ * no automation copies, seed a cursor against the wrong history, and report a
+ * clean run having done nothing. Silent success is this project's oldest bug.
+ * So every pass checks who it is first and refuses if it is not this address.
+ */
+var EXPECTED_MAILBOX = 'projects@group247ww.com';
+
 /** The intake's ledger. READ ONLY — this script never writes to it. */
 var LEDGER_SPREADSHEET_ID = '1HEx6QQaTyOazuOEX0K0RdfxRzO843gouL00zHCIRldw';
 var LEDGER_SHEET = 'ledger';
@@ -261,6 +273,16 @@ function runRelayPass(deps, opts) {
   var mode = String(deps.props.get(PROP_RELAY_MODE) || 'off').toLowerCase();
   summary.mode = mode;
   if (mode !== 'on') { return summary; }
+
+  // Identity before anything else — see EXPECTED_MAILBOX.
+  var who = String(deps.gmail.profile() || '').toLowerCase();
+  if (who !== EXPECTED_MAILBOX.toLowerCase()) {
+    summary.wrongMailbox = who || '(unknown)';
+    deps.log('error', 'REFUSING TO RUN: this pass is running as ' + who +
+      ', not ' + EXPECTED_MAILBOX + '. Sign in as that account and install the ' +
+      'trigger there — sharing the project is not the same as running as it.');
+    return summary;
+  }
 
   function note(reason) {
     summary.reasons[reason] = (summary.reasons[reason] || 0) + 1;
@@ -598,8 +620,10 @@ function relayPreflight() {
   ck('gmail profile', function () { return gmailService_().profile(); });
   ck('mailbox is projects@', function () {
     var m = gmailService_().profile().toLowerCase();
-    if (m !== 'projects@group247ww.com') {
-      throw new Error('running as ' + m + ' — this script must run as projects@group247ww.com');
+    if (m !== EXPECTED_MAILBOX.toLowerCase()) {
+      throw new Error('running as ' + m + ' — this script must RUN AS ' + EXPECTED_MAILBOX +
+        '. Owning or sharing the project is not enough: sign in as that account to ' +
+        'authorise it and to install the trigger.');
     }
     return 'yes';
   });

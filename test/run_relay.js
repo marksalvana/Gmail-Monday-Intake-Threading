@@ -185,6 +185,7 @@ function rig(o) {
     calls, cursors,
     deps: {
       gmail: {
+        profile: () => 'projects@group247ww.com',
         currentHistoryId: () => 'H999',
         historyList: () => { calls.push('historyList'); return o.page || { messageIds: [], newHistoryId: 'H1000' }; },
         messageMeta: (id) => (o.messages || {})[id] || { ok: false, id },
@@ -205,6 +206,18 @@ function rig(o) {
     }
   };
 }
+
+check('IT REFUSES TO RUN AS THE WRONG MAILBOX', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  messages: { GM1: MSG() } });
+  r.deps.gmail.profile = () => 'msalvana@group247ww.com';
+  const s = S.runRelayPass(r.deps, {});
+  eq(s.wrongMailbox, 'msalvana@group247ww.com');
+  eq(s.relayed, 0);
+  eq(r.calls.length, 0, 'sharing the project is not the same as running as the account');
+  eq(r.cursors[S.CURSOR_KEY], 'H1', 'and it must not seed a cursor against the wrong mailbox');
+});
 
 check('mode off touches nothing at all', () => {
   const r = rig({ mode: 'off', page: { messageIds: ['GM1'], newHistoryId: 'H2' } });
