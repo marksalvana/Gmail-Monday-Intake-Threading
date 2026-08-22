@@ -80,6 +80,22 @@ var STATE_HEADERS = ['ts', 'route', 'sourceMessageId', 'itemId', 'toMailbox',
 var PROP_RELAY_MODE = 'G247_RELAY_MODE';
 var CURSOR_KEY = 'relayCursor';
 
+/**
+ * Addresses at these domains are US, not a client.
+ *
+ * The split between the two deployments is by DOMAIN, not by recipient count.
+ * The first version asked "is the item address the ONLY recipient?" and was
+ * wrong in practice: monday's config for the Approved / Rejected / Cancel
+ * automations says they send to {{item.p_email}} alone, but the messages
+ * actually go out to the pulse address AND the PM —
+ *   To: pulse-12872173573@g247ww.us.monday.com, msalvana@group247ww.com
+ * (read from the live Sent copy, 22 Aug). That made every internal approval
+ * email look client-facing and the INTERNAL relay declined all of them.
+ *
+ * Domain is the question that actually matters anyway: has anything left G247?
+ */
+var INTERNAL_DOMAINS = ['group247ww.com'];
+
 /** Header the intake already drops on, so a relayed copy is never re-ingested. */
 var SYNC_HEADER_NAME = 'X-G247-Sync';
 var SYNC_HEADER_VALUE = 'monday-relay';
@@ -123,13 +139,22 @@ function extractAddresses(headerValues) {
   return out;
 }
 
+/** Is this one of ours? PURE. */
+function isInternalAddress(addr) {
+  var a = String(addr || '').toLowerCase();
+  for (var i = 0; i < INTERNAL_DOMAINS.length; i++) {
+    if (a.slice(-(INTERNAL_DOMAINS[i].length + 1)) === '@' + INTERNAL_DOMAINS[i]) { return true; }
+  }
+  return false;
+}
+
 /**
  * Which route does this message belong to?
  *
- * 'internal' — every recipient is an item address. These are the seven
- *              approval/cancel automations that loop back into the item.
- * 'client'   — an item address AND at least one human address. This is the
- *              Group Email route, the only one a client actually receives.
+ * 'internal' — goes to the item and, at most, G247 people. Nothing has left the
+ *              company. The approval, cancel and feedback automations.
+ * 'client'   — at least one recipient outside G247. The Group Email route, the
+ *              only one a client actually receives.
  * ''         — no item address at all, so there is no item id and nothing to
  *              match against. The Change Request and due-date automations fall
  *              here and CANNOT be relayed by this mechanism.
@@ -138,12 +163,13 @@ function extractAddresses(headerValues) {
 function classifyRoute(addresses) {
   var addrs = addresses || [];
   var pulses = 0;
-  var humans = 0;
+  var external = 0;
   addrs.forEach(function (a) {
-    if (/pulse-\d+@[a-z0-9.\-]*monday\.com/i.test(a)) { pulses++; } else { humans++; }
+    if (/pulse-\d+@[a-z0-9.\-]*monday\.com/i.test(a)) { pulses++; }
+    else if (!isInternalAddress(a)) { external++; }
   });
   if (!pulses) { return ''; }
-  return humans ? 'client' : 'internal';
+  return external ? 'client' : 'internal';
 }
 
 // ================================================================ FORMATTING

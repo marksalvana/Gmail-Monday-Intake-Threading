@@ -48,8 +48,31 @@ check('item address only is the internal route', () => {
   eq(S.classifyRoute(['pulse-1@g247ww.us.monday.com']), 'internal');
 });
 
-check('item address plus a person is the client route', () => {
+check('THE ITEM PLUS A G247 PERSON IS STILL INTERNAL', () => {
+  // Read from the live Sent copy on 22 Aug: monday's config claims this
+  // automation sends to p_email alone, and it does not.
+  eq(S.classifyRoute([
+    'pulse-12872173573@g247ww.us.monday.com', 'msalvana@group247ww.com'
+  ]), 'internal', 'nothing has left G247, so it is not client mail');
+  eq(S.classifyRoute([
+    'pulse-1@g247ww.us.monday.com', 'sgow@group247ww.com', 'mdelarosa@group247ww.com'
+  ]), 'internal');
+});
+
+check('one outside address makes it client, however many insiders there are', () => {
   eq(S.classifyRoute(['pulse-1@g247ww.us.monday.com', 'j.lee@inovapharma.com']), 'client');
+  eq(S.classifyRoute([
+    'j.lee@inovapharma.com', 'pulse-1@g247ww.us.monday.com', 'sgow@group247ww.com'
+  ]), 'client', 'the Group Email route');
+});
+
+check('the domain test matches the whole domain, not a suffix', () => {
+  eq(S.isInternalAddress('a@group247ww.com'), true);
+  eq(S.isInternalAddress('A@GROUP247WW.COM'), true);
+  eq(S.isInternalAddress('a@notgroup247ww.com'), false,
+    'a lookalike domain must not be treated as ours');
+  eq(S.isInternalAddress('a@group247ww.com.evil.net'), false);
+  eq(S.isInternalAddress(''), false);
 });
 
 check('no item address at all is neither — it cannot be matched to a project', () => {
