@@ -293,7 +293,18 @@ function runRelayPass(deps, opts) {
 
   // FIRST RUN SEEDS AND RELAYS NOTHING — otherwise switching this on would
   // replay every historical automation email into live client threads.
+  //
+  // A DRY RUN MUST NOT SEED. Writing the cursor is a state change, and a dry run
+  // that changes state is a lie: you would preview, see "seeded", and have
+  // silently moved the starting point without sending anything. Report what it
+  // WOULD do and leave the cursor alone.
   if (!cursor) {
+    if (opts.dryRun) {
+      summary.wouldSeed = true;
+      deps.log('info', 'DRY RUN: cursor is unseeded. A real run would seed it at the ' +
+        'current history id and relay nothing. No cursor was written.');
+      return summary;
+    }
     deps.state.setCursor(CURSOR_KEY, deps.gmail.currentHistoryId());
     summary.seeded = true;
     return summary;

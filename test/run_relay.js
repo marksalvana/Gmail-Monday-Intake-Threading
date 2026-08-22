@@ -234,6 +234,14 @@ check('THE FIRST RUN SEEDS AND RELAYS NOTHING', () => {
   eq(r.cursors[S.CURSOR_KEY], 'H999');
 });
 
+check('A DRY RUN NEVER SEEDS THE CURSOR', () => {
+  const r = rig({ page: { messageIds: ['GM1'], newHistoryId: 'H2' }, messages: { GM1: MSG() } });
+  const s = S.runRelayPass(r.deps, { dryRun: true });
+  eq(s.wouldSeed, true);
+  eq(s.seeded, false, 'a preview that changes state is a lie');
+  eq(r.cursors[S.CURSOR_KEY], undefined, 'the starting point must be untouched');
+});
+
 check('the record is written BEFORE the send, and again after', () => {
   const r = rig({
     cursors: { [S.CURSOR_KEY]: 'H1' },
