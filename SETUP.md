@@ -60,7 +60,17 @@ authorise, and install the trigger from that session.
    projects@group247ww.com as Editor.
 2. Paste the matching file into it: `Relay-INTERNAL.gs` or `Relay-CLIENT.gs`.
    They are identical except for line 46, `var ROUTE`.
-3. **Services → add the Gmail advanced service** (identifier `Gmail`).
+3. **Add the Gmail API.** Click the **`<>` Editor** icon in the left rail — not
+   Project Settings. The panel lists **Files**, **Libraries**, **Services**;
+   hover over **Services** and click the **⊕** at its right. In the dialog,
+   scroll to **Gmail API**, select it, leave the identifier as `Gmail`, and
+   click **Add**.
+
+   Google's dialog says "Gmail API", not "advanced service". The identifier
+   matters: the code calls `Gmail.Users.Messages.get(...)`, so anything other
+   than `Gmail` fails with "Gmail is not defined". Services are per-project, so
+   do this on each relay project separately — sharing a project does not carry
+   them over.
 4. Create a **new, empty Google Sheet** for this script's own state — one per
    script, not shared. Paste its id into `STATE_SPREADSHEET_ID` near the top.
    Its own sheet matters: Apps Script's lock is scoped to a project, so separate
