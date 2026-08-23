@@ -92,7 +92,11 @@ const MSG = (o) => Object.assign({
 const CTX = (o) => Object.assign({
   route: 'internal',
   alreadyRelayed: false,
-  anchorFor: () => ANCHOR
+  anchorFor: () => ANCHOR,
+  // A thread with a real client on it. The client route now requires one, so
+  // leaving this out would make every client-route assertion pass or fail for
+  // the wrong reason.
+  participantsFor: () => ['j.lee@inovapharma.com', 'msalvana@group247ww.com']
 }, o || {});
 
 suite('shouldRelay — every reason not to send');
@@ -605,6 +609,43 @@ check('internal rows are not this alert’s business', () => {
 check('the alert text names the dead-relay case first', () => {
   const msg = S.healthMessage(S.healthCheck([], [{ id: 'A', ts: 0 }], S.HEALTH_STALE_MS + 1));
   truthy(/NOT RELAYED AT ALL/.test(msg), msg);
+});
+
+suite('The all-internal guard — the failure the audit found');
+
+check('A THREAD WITH NO CLIENT ON IT IS NOT RELAYED', () => {
+  // clientRecipients() always appends the PM, so the list is never empty and an
+  // empty-list check protects nothing. Without this guard the approval request
+  // goes to G247 staff, records 'sent', and the client never learns they were
+  // asked. 8 of 18 audited projects are exactly this shape.
+  const v = S.shouldRelay(CLIENT_MSG(), clientCtx({
+    participantsFor: () => ['msalvana@group247ww.com', 'dnoble@group247ww.com']
+  }));
+  eq(v.relay, false);
+  eq(v.reason, 'no-client-on-thread');
+});
+
+check('one outsider is enough', () => {
+  const v = S.shouldRelay(CLIENT_MSG(), clientCtx({
+    participantsFor: () => ['msalvana@group247ww.com', 'j.lee@inovapharma.com']
+  }));
+  eq(v.relay, true);
+  eq(v.outsiders, ['j.lee@inovapharma.com'], 'and the outsiders are named for the log');
+});
+
+check('a blocklisted outsider does NOT count as a client', () => {
+  // mailer-daemon@googlemail.com and notifications@monday.com are both live in
+  // the ledger. Neither makes a thread client-reachable.
+  const v = S.shouldRelay(CLIENT_MSG(), clientCtx({
+    participantsFor: () => ['msalvana@group247ww.com', 'mailer-daemon@googlemail.com']
+  }));
+  eq(v.relay, false);
+  eq(v.reason, 'no-client-on-thread');
+});
+
+check('THE INTERNAL ROUTE IS UNAFFECTED — it is meant to go to us', () => {
+  const v = S.shouldRelay(MSG(), CTX({ route: 'internal' }));
+  eq(v.relay, true, 'internal mail addressed only to G247 is the whole point of that route');
 });
 
 report();

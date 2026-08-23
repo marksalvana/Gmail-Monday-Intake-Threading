@@ -409,16 +409,31 @@ function shouldRelay(m, ctx) {
              recipients: [anchor.mailbox] };
   }
 
-  // The client route goes to the thread. If the ledger has nobody, sending a
-  // copy addressed to no one would log a clean 'sent' and reach nobody — the
-  // exact silent success this project keeps producing. Skip loudly instead.
   var people = clientRecipients(
     ctx.participantsFor ? ctx.participantsFor(anchor.threadId) : [], anchor.mailbox);
   if (!people.length) {
     return { relay: false, reason: 'no-recipients-in-ledger', itemId: ids[0] };
   }
 
-  return { relay: true, reason: 'ok', itemId: ids[0], anchor: anchor, recipients: people };
+  // AN ALL-INTERNAL RECIPIENT LIST IS A FAILURE, NOT A SMALL AUDIENCE.
+  //
+  // clientRecipients() always appends the PM, so the list is never empty — which
+  // means an empty-list check protects nothing. On a thread with no client on
+  // it, this route would send the approval request to G247 staff, record 'sent',
+  // and the client would never learn they were asked. The 23 August audit says
+  // that is the majority case: of 18 projects, 8 were internal-only and of the
+  // 10 with an outside address, every one was a vendor or a test account — not
+  // a single real client.
+  //
+  // So the question is not "is anyone addressed" but "is anyone OUTSIDE
+  // addressed". If not, the relay must not pretend it delivered.
+  var outsiders = people.filter(function (a) { return !isInternalAddress(a); });
+  if (!outsiders.length) {
+    return { relay: false, reason: 'no-client-on-thread', itemId: ids[0] };
+  }
+
+  return { relay: true, reason: 'ok', itemId: ids[0], anchor: anchor,
+           recipients: people, outsiders: outsiders };
 }
 
 // ==================================================================== HEALTH
