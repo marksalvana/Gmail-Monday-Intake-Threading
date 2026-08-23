@@ -96,6 +96,34 @@ var CURSOR_KEY = 'relayCursor';
  */
 var INTERNAL_DOMAINS = ['group247ww.com'];
 
+/**
+ * THE ROUTE MARKER. A recipient, not a mailbox.
+ *
+ * Once the client-facing automations stop addressing the client directly, every
+ * recipient left on them is either the item or a @group247ww.com address — so
+ * the domain rule above would classify them as INTERNAL and the wrong
+ * deployment would relay them. The marker is how a client-facing automation is
+ * identified deterministically.
+ *
+ * Routing on subject text was considered and rejected: subjects are editable by
+ * anyone with board access, so a wording change would silently reroute client
+ * mail.
+ *
+ * It must exist as an address (a Google Group with no members, or an alias that
+ * discards) so monday can send to it without bouncing. Nothing ever reads it.
+ */
+var CLIENT_ROUTE_MARKER = 'monday-client-relay@group247ww.com';
+
+/**
+ * Never a recipient of a relayed copy, whatever the ledger says.
+ * Automated senders end up on threads and must not be mailed back.
+ */
+var RECIPIENT_BLOCKLIST = ['noreply', 'no-reply', 'donotreply', 'do-not-reply',
+  'mailer-daemon', 'postmaster', 'bounce', 'notifications'];
+
+/** Where self-mode copies and every health alert go. */
+var ALERT_EMAIL = 'msalvana@group247ww.com';
+
 /** Header the intake already drops on, so a relayed copy is never re-ingested. */
 var SYNC_HEADER_NAME = 'X-G247-Sync';
 var SYNC_HEADER_VALUE = 'monday-relay';
@@ -104,6 +132,23 @@ var SYNC_HEADER_VALUE = 'monday-relay';
 var RELAY_MAX_PER_HOUR = 40;
 var RELAY_WINDOW_MS = 60 * 60 * 1000;
 var PROP_RELAY_RATE = 'G247_RELAY_RATE';
+
+/**
+ * The client route gets its OWN counter, and a lower cap.
+ *
+ * Deferring internal chatter for an hour is harmless. Deferring a client's
+ * approval request is not: "we will send it when the window rolls" is
+ * indistinguishable, from the client's side, from never sending it. So hitting
+ * this cap raises an alert rather than quietly waiting.
+ */
+var CLIENT_MAX_PER_HOUR = 20;
+var PROP_CLIENT_RATE = 'G247_RELAY_RATE_CLIENT';
+
+/** A client-route send may be attempted twice. Never more. */
+var CLIENT_MAX_ATTEMPTS = 2;
+
+/** A marker message with no state row after this long is presumed lost. */
+var HEALTH_STALE_MS = 30 * 60 * 1000;
 
 var MAX_BATCH = 25;
 
@@ -164,12 +209,61 @@ function classifyRoute(addresses) {
   var addrs = addresses || [];
   var pulses = 0;
   var external = 0;
+  var marked = false;
   addrs.forEach(function (a) {
-    if (/pulse-\d+@[a-z0-9.\-]*monday\.com/i.test(a)) { pulses++; }
-    else if (!isInternalAddress(a)) { external++; }
+    var v = String(a || '').toLowerCase();
+    if (/pulse-\d+@[a-z0-9.\-]*monday\.com/i.test(v)) { pulses++; return; }
+    if (v === CLIENT_ROUTE_MARKER.toLowerCase()) { marked = true; return; }
+    if (!isInternalAddress(v)) { external++; }
   });
   if (!pulses) { return ''; }
+
+  // THE MARKER OUTRANKS THE DOMAIN RULE, and must. Once the client is removed
+  // from an automation's recipients, everything left is internal-looking; the
+  // marker is the only thing that still says "a client is meant to see this".
+  if (marked) { return 'client'; }
+
   return external ? 'client' : 'internal';
+}
+
+/**
+ * Who the relayed client copy is addressed to.
+ *
+ * The relay runs as projects@group247ww.com and CANNOT read the thread — it
+ * lives in the PM's mailbox — so this list comes from the intake's ledger,
+ * written when the project was created and rewritten on every reply.
+ *
+ * Everything removed here is removed for a reason:
+ *   projects@   we are sending FROM it; mailing ourselves would loop
+ *   pulse-*     monday's own address; relaying to it would create an update
+ *               loop between the two systems
+ *   the marker  a discard address, and a recipient of the original
+ *   blocklist   automated senders that end up on threads
+ * PURE.
+ */
+function clientRecipients(participants, pmMailbox) {
+  var out = [];
+  var seen = {};
+  (participants || []).forEach(function (raw) {
+    var a = String(raw || '').trim().toLowerCase();
+    if (!a || seen[a]) { return; }
+    if (a === String(EXPECTED_MAILBOX).toLowerCase()) { return; }
+    if (a === String(CLIENT_ROUTE_MARKER).toLowerCase()) { return; }
+    if (/pulse-\d+@[a-z0-9.\-]*monday\.com/i.test(a)) { return; }
+    var local = a.split('@')[0];
+    for (var i = 0; i < RECIPIENT_BLOCKLIST.length; i++) {
+      if (local.indexOf(RECIPIENT_BLOCKLIST[i]) !== -1) { return; }
+    }
+    seen[a] = true;
+    out.push(a);
+  });
+
+  // The PM belongs on their own project's client mail even if a stale
+  // participant list has lost them. Added last so it never displaces a client.
+  var pm = String(pmMailbox || '').trim().toLowerCase();
+  if (pm && !seen[pm]) { out.push(pm); }
+
+  return out;
 }
 
 // ================================================================ FORMATTING
@@ -206,6 +300,11 @@ function buildRelayMime(a, b64) {
   var lines = [];
   lines.push('To: ' + a.to);
   lines.push('Subject: ' + encodeSubject(replySubject(a.threadSubject), b64));
+  // REPLY-TO IS WHAT KEEPS THE LOOP CLOSED. The copy is sent from projects@,
+  // which no PM reads and which the intake — running as the PM — would never
+  // ingest. Without this header a client's reply lands nowhere and silently
+  // never reaches the monday item.
+  if (a.replyTo) { lines.push('Reply-To: ' + a.replyTo); }
   var ref = '<' + String(a.headerMessageId || '').replace(/^<|>$/g, '') + '>';
   lines.push('In-Reply-To: ' + ref);
   lines.push('References: ' + ref);
@@ -232,8 +331,9 @@ function relayBody(a) {
 
 // =============================================================== RATE LIMIT
 
-function relayRateGate(store, nowMs, limit, windowMs) {
-  var raw = store.get(PROP_RELAY_RATE);
+function relayRateGate(store, nowMs, limit, windowMs, key) {
+  key = key || PROP_RELAY_RATE;
+  var raw = store.get(key);
   var st;
   try { st = raw ? JSON.parse(raw) : null; } catch (e) { st = null; }
   if (!st || typeof st.windowStart !== 'number' || (nowMs - st.windowStart) >= windowMs) {
@@ -243,7 +343,7 @@ function relayRateGate(store, nowMs, limit, windowMs) {
   return {
     allow: true,
     count: st.count,
-    commit: function () { st.count++; st.lastAt = nowMs; store.set(PROP_RELAY_RATE, JSON.stringify(st)); }
+    commit: function () { st.count++; st.lastAt = nowMs; store.set(key, JSON.stringify(st)); }
   };
 }
 
@@ -272,7 +372,29 @@ function shouldRelay(m, ctx) {
     return { relay: false, reason: ids.length ? 'ambiguous-multiple-items' : 'no-item-id' };
   }
 
-  if (ctx.alreadyRelayed) { return { relay: false, reason: 'already-relayed' }; }
+  // PRIOR ATTEMPTS.
+  //
+  // 'sent'    done.
+  // 'sending' recorded before the send, so the outcome is UNKNOWN — the pass
+  //           may have died between writing the row and Gmail accepting the
+  //           message. Never retried: a duplicate email to a client cannot be
+  //           recalled, and record-before-send exists precisely to buy that.
+  //           relayHealth() surfaces it for a human instead.
+  // 'FAILED'  the send threw, so nothing went out. Safe to retry — and on the
+  //           client route, necessary: "not retried" means a client never hears
+  //           about their approval.
+  var prior = ctx.priorAttempts ||
+    (ctx.alreadyRelayed ? { last: 'sent', failures: 0 } : null);
+  if (prior && prior.last) {
+    if (prior.last === 'sent') { return { relay: false, reason: 'already-relayed' }; }
+    if (prior.last === 'sending') { return { relay: false, reason: 'in-flight-outcome-unknown' }; }
+    if (prior.last === 'FAILED') {
+      if (ctx.route !== 'client') { return { relay: false, reason: 'failed-not-retried' }; }
+      if ((prior.failures || 0) >= CLIENT_MAX_ATTEMPTS) {
+        return { relay: false, reason: 'retries-exhausted' };
+      }
+    }
+  }
 
   var anchor = ctx.anchorFor(ids[0]);
   if (!anchor || !anchor.threadId || !anchor.headerMessageId || !anchor.mailbox) {
@@ -281,7 +403,104 @@ function shouldRelay(m, ctx) {
     return { relay: false, reason: 'item-has-no-gmail-thread', itemId: ids[0] };
   }
 
-  return { relay: true, reason: 'ok', itemId: ids[0], anchor: anchor };
+  // The internal route goes to the PM alone, exactly as it does today.
+  if (ctx.route !== 'client') {
+    return { relay: true, reason: 'ok', itemId: ids[0], anchor: anchor,
+             recipients: [anchor.mailbox] };
+  }
+
+  // The client route goes to the thread. If the ledger has nobody, sending a
+  // copy addressed to no one would log a clean 'sent' and reach nobody — the
+  // exact silent success this project keeps producing. Skip loudly instead.
+  var people = clientRecipients(
+    ctx.participantsFor ? ctx.participantsFor(anchor.threadId) : [], anchor.mailbox);
+  if (!people.length) {
+    return { relay: false, reason: 'no-recipients-in-ledger', itemId: ids[0] };
+  }
+
+  return { relay: true, reason: 'ok', itemId: ids[0], anchor: anchor, recipients: people };
+}
+
+// ==================================================================== HEALTH
+
+/**
+ * THE COMPENSATING CONTROL.
+ *
+ * Once monday stops emailing the client directly, this script is the only thing
+ * standing between an approval request and a client who never hears about it.
+ * A relay that dies produces no error anywhere — it simply stops, and every
+ * symptom is an absence. So something has to look for the absence.
+ *
+ * Two questions, and the second is the one that matters:
+ *   1. is any client-route message recorded as something other than sent?
+ *   2. did a client-facing automation go out with NO row at all?
+ *
+ * (2) is what catches a dead trigger, an expired authorisation, or a pass that
+ * never ran. (1) alone would report a clean bill of health on a relay that has
+ * not executed in a week.
+ * PURE.
+ *
+ * @param {Array} rows      state-sheet rows
+ * @param {Array} markerMsgs [{id, ts}] sent mail addressed to CLIENT_ROUTE_MARKER
+ * @param {number} nowMs
+ */
+function healthCheck(rows, markerMsgs, nowMs) {
+  var out = { ok: true, checkedRows: 0, checkedMessages: 0, stuck: [], lost: [] };
+  var bySource = {};
+
+  (rows || []).forEach(function (r) {
+    if (String(r.route || '') !== 'client') { return; }
+    out.checkedRows++;
+    var id = String(r.sourceMessageId || '');
+    var res = String(r.result || '');
+    bySource[id] = res;
+  });
+
+  Object.keys(bySource).forEach(function (id) {
+    var res = bySource[id];
+    if (res === 'sent' || res === 'sent-self') { return; }
+    out.stuck.push({ sourceMessageId: id, result: res || '(blank)' });
+  });
+
+  (markerMsgs || []).forEach(function (m) {
+    out.checkedMessages++;
+    var id = String(m.id || '');
+    if (bySource[id] !== undefined) { return; }
+    var age = nowMs - Number(m.ts || 0);
+    if (age < HEALTH_STALE_MS) { return; }   // still within the relay's window
+    out.lost.push({ sourceMessageId: id, ageMinutes: Math.round(age / 60000) });
+  });
+
+  out.ok = (out.stuck.length === 0 && out.lost.length === 0);
+  return out;
+}
+
+/** Format a health report as something a human reads at 8am. PURE. */
+function healthMessage(h) {
+  if (h.ok) {
+    return 'Client relay healthy. ' + h.checkedRows + ' relayed message(s) on record, ' +
+      h.checkedMessages + ' client automation(s) seen, none unaccounted for.';
+  }
+  var out = ['CLIENT RELAY NEEDS ATTENTION.', ''];
+  if (h.lost.length) {
+    out.push('NOT RELAYED AT ALL — a client automation was sent and this script ' +
+      'never recorded it. The relay may not be running:');
+    h.lost.forEach(function (l) {
+      out.push('  ' + l.sourceMessageId + '  (' + l.ageMinutes + ' minutes ago)');
+    });
+    out.push('');
+  }
+  if (h.stuck.length) {
+    out.push('RECORDED BUT NOT SENT:');
+    h.stuck.forEach(function (t) {
+      out.push('  ' + t.sourceMessageId + '  -> ' + t.result);
+    });
+    out.push('');
+    out.push('A row reading "sending" means the outcome is unknown: the pass died ' +
+      'between recording and sending. Check the mailbox before re-sending by ' +
+      'hand — a duplicate to a client cannot be recalled.');
+  }
+  return out.join('\n');
 }
 
 // ============================================================== ORCHESTRATOR
@@ -296,9 +515,14 @@ function runRelayPass(deps, opts) {
   var summary = { route: ROUTE, mode: '', scanned: 0, relayed: 0, skipped: 0,
                   failed: 0, seeded: false, reasons: {} };
 
+  // off  = nothing sent.
+  // self = built and sent, but addressed to ALERT_EMAIL only, so the client
+  //        copy can be read exactly as the client would read it before a
+  //        client ever receives one. Everything else is identical.
+  // on   = live.
   var mode = String(deps.props.get(PROP_RELAY_MODE) || 'off').toLowerCase();
   summary.mode = mode;
-  if (mode !== 'on') { return summary; }
+  if (mode !== 'on' && mode !== 'self') { return summary; }
 
   // Identity before anything else — see EXPECTED_MAILBOX.
   var who = String(deps.gmail.profile() || '').toLowerCase();
@@ -346,20 +570,37 @@ function runRelayPass(deps, opts) {
 
     var verdict = shouldRelay(m, {
       route: ROUTE,
-      alreadyRelayed: deps.store.hasRelayed(m.id),
-      anchorFor: function (itemId) { return deps.ledger.itemThread(itemId); }
+      priorAttempts: deps.store.attemptsFor(m.id),
+      anchorFor: function (itemId) { return deps.ledger.itemThread(itemId); },
+      participantsFor: function (threadId) { return deps.ledger.threadParticipants(threadId); }
     });
 
     if (!verdict.relay) { note(verdict.reason); continue; }
 
-    var gate = relayRateGate(deps.props, deps.nowMs(), RELAY_MAX_PER_HOUR, RELAY_WINDOW_MS);
+    var isClient = (ROUTE === 'client');
+    var cap = isClient ? CLIENT_MAX_PER_HOUR : RELAY_MAX_PER_HOUR;
+    var gate = relayRateGate(deps.props, deps.nowMs(),
+      cap, RELAY_WINDOW_MS, isClient ? PROP_CLIENT_RATE : PROP_RELAY_RATE);
     if (!gate.allow) {
-      deps.log('warn', 'relay hit ' + RELAY_MAX_PER_HOUR + '/hour cap; stopping this pass');
+      summary.rateCapped = true;
+      deps.log('warn', 'relay hit ' + cap + '/hour cap; stopping this pass');
+      // On the internal route a deferral is harmless. On the client route it is
+      // indistinguishable, from the client's side, from never sending at all,
+      // so somebody is told.
+      if (isClient) { deps.alert('G247 relay: CLIENT rate cap hit',
+        'The client relay hit its ' + cap + '/hour cap and stopped this pass. ' +
+        'Approval emails are waiting and will not go out until the window ' +
+        'rolls. Check the relay state sheet.'); }
       break;   // cursor is not advanced past it — retried next window
     }
 
+    var recipients = (verdict.recipients || []).slice();
+    var selfMode = (mode === 'self');
+    var toLine = selfMode ? ALERT_EMAIL : recipients.join(', ');
+
     var raw = buildRelayMime({
-      to: verdict.anchor.mailbox,
+      to: toLine,
+      replyTo: (ROUTE === 'client') ? verdict.anchor.mailbox : '',
       threadSubject: verdict.anchor.subject,
       headerMessageId: verdict.anchor.headerMessageId,
       itemId: verdict.itemId,
@@ -375,7 +616,9 @@ function runRelayPass(deps, opts) {
 
     if (opts.dryRun) {
       deps.log('info', 'DRY RUN would relay "' + m.subject + '" (item ' + verdict.itemId +
-        ') into ' + verdict.anchor.mailbox + ' thread ' + verdict.anchor.threadId);
+        ') to ' + toLine + ' — thread ' + verdict.anchor.threadId +
+        (selfMode ? '  [SELF MODE: the real recipients would be ' +
+          recipients.join(', ') + ']' : ''));
       summary.relayed++;
       continue;
     }
@@ -384,8 +627,9 @@ function runRelayPass(deps, opts) {
     // can be re-sent by hand. Same rule as the outbound bridge.
     deps.store.record({
       ts: deps.now(), route: ROUTE, sourceMessageId: m.id, itemId: verdict.itemId,
-      toMailbox: verdict.anchor.mailbox, threadId: verdict.anchor.threadId,
-      subject: m.subject, relayedMessageId: '', result: 'sending', detail: ''
+      toMailbox: toLine, threadId: verdict.anchor.threadId,
+      subject: m.subject, relayedMessageId: '', result: 'sending',
+      detail: selfMode ? 'self mode; live recipients would be ' + recipients.join(', ') : ''
     });
 
     try {
@@ -394,18 +638,29 @@ function runRelayPass(deps, opts) {
       summary.relayed++;
       deps.store.record({
         ts: deps.now(), route: ROUTE, sourceMessageId: m.id, itemId: verdict.itemId,
-        toMailbox: verdict.anchor.mailbox, threadId: verdict.anchor.threadId,
-        subject: m.subject, relayedMessageId: sent, result: 'sent', detail: ''
+        toMailbox: toLine, threadId: verdict.anchor.threadId,
+        subject: m.subject, relayedMessageId: sent,
+        result: selfMode ? 'sent-self' : 'sent', detail: ''
       });
     } catch (e) {
       summary.failed++;
       deps.store.record({
         ts: deps.now(), route: ROUTE, sourceMessageId: m.id, itemId: verdict.itemId,
-        toMailbox: verdict.anchor.mailbox, threadId: verdict.anchor.threadId,
+        toMailbox: toLine, threadId: verdict.anchor.threadId,
         subject: m.subject, relayedMessageId: '', result: 'FAILED',
         detail: String(e && e.message).slice(0, 300)
       });
-      deps.log('error', 'relay failed for ' + m.id + ' and will NOT be retried: ' + (e && e.message));
+      var willRetry = (ROUTE === 'client') &&
+        (((deps.store.attemptsFor(m.id) || {}).failures || 0) < CLIENT_MAX_ATTEMPTS);
+      deps.log('error', 'relay failed for ' + m.id +
+        (willRetry ? ' — one retry on the next pass' : ' and will NOT be retried') +
+        ': ' + (e && e.message));
+      if (!willRetry && ROUTE === 'client') {
+        deps.alert('G247 relay: CLIENT send FAILED, not retrying',
+          'Item ' + verdict.itemId + ' (' + m.subject + ') could not be relayed to ' +
+          recipients.join(', ') + ' after ' + CLIENT_MAX_ATTEMPTS + ' attempts. ' +
+          'The client has NOT received it. Error: ' + (e && e.message));
+      }
     }
   }
 
@@ -543,8 +798,10 @@ function gmailService_() {
  */
 function ledgerReader_() {
   var byItem = null;
+  var byThread = null;
   function load() {
     byItem = {};
+    byThread = {};
     var sh = SpreadsheetApp.openById(LEDGER_SPREADSHEET_ID).getSheetByName(LEDGER_SHEET);
     if (!sh) { throw new Error('ledger sheet "' + LEDGER_SHEET + '" not found'); }
     var values = sh.getDataRange().getValues();
@@ -553,7 +810,18 @@ function ledgerReader_() {
     var col = {};
     head.forEach(function (h, i) { col[String(h)] = i; });
     for (var r = 1; r < values.length; r++) {
-      if (String(values[r][col.kind]) !== 'item') { continue; }
+      var kind = String(values[r][col.kind]);
+
+      // Participant rows, written by the intake on create and on every reply.
+      // LAST ONE WINS — the newest row is the current state of the thread.
+      if (kind === 'participants') {
+        if (col.participants === undefined) { continue; }
+        byThread[String(values[r][col.threadId] || '')] =
+          String(values[r][col.participants] || '');
+        continue;
+      }
+
+      if (kind !== 'item') { continue; }
       byItem[String(values[r][col.key])] = {
         mailbox: String(values[r][col.mailbox] || ''),
         threadId: String(values[r][col.threadId] || ''),
@@ -566,6 +834,13 @@ function ledgerReader_() {
     itemThread: function (itemId) {
       if (byItem === null) { load(); }
       return byItem[String(itemId)] || null;
+    },
+    threadParticipants: function (threadId) {
+      if (byItem === null) { load(); }
+      var raw = byThread[String(threadId || '')];
+      if (!raw) { return []; }
+      return String(raw).split(',').map(function (a) { return a.trim().toLowerCase(); })
+        .filter(function (a) { return !!a; });
     }
   };
 }
@@ -590,15 +865,52 @@ function relayStore_() {
     if (cache) { return cache; }
     cache = {};
     var values = sheet().getDataRange().getValues();
-    for (var r = 1; r < values.length; r++) { cache[String(values[r][2])] = true; }
+    var ri = STATE_HEADERS.indexOf('result');
+    for (var r = 1; r < values.length; r++) {
+      var k = String(values[r][2]);
+      var res = String(values[r][ri] || '');
+      var a = cache[k] || { last: '', failures: 0 };
+      a.last = res;
+      if (res === 'FAILED') { a.failures++; }
+      cache[k] = a;
+    }
     return cache;
   }
   return {
-    hasRelayed: function (sourceMessageId) { return !!loaded()[String(sourceMessageId)]; },
+    hasRelayed: function (sourceMessageId) {
+      var a = loaded()[String(sourceMessageId)];
+      return !!(a && a.last);
+    },
+
+    /**
+     * What has already been tried for this source message.
+     * {last: 'sent'|'sending'|'FAILED'|'sent-self', failures: n} or null.
+     * The retry decision in shouldRelay() is made entirely from this.
+     */
+    attemptsFor: function (sourceMessageId) {
+      return loaded()[String(sourceMessageId)] || null;
+    },
+
     record: function (rec) {
       var sh = sheet();
       sh.appendRow(STATE_HEADERS.map(function (h) { return rec[h] === undefined ? '' : rec[h]; }));
-      loaded()[String(rec.sourceMessageId)] = true;
+      var k = String(rec.sourceMessageId);
+      var a = loaded()[k] || { last: '', failures: 0 };
+      a.last = String(rec.result || '');
+      if (a.last === 'FAILED') { a.failures++; }
+      loaded()[k] = a;
+    },
+
+    /** Every client-route row, for relayHealth(). */
+    allRows: function () {
+      var values = sheet().getDataRange().getValues();
+      var out = [];
+      for (var r = 1; r < values.length; r++) {
+        var row = {};
+        STATE_HEADERS.forEach(function (h, i) { row[h] = values[r][i]; });
+        out.push(row);
+      }
+      return out;
     }
   };
 }
@@ -613,7 +925,11 @@ function deps_() {
     now: function () { return new Date().toISOString(); },
     nowMs: function () { return Date.now(); },
     b64: function (s) { return Utilities.base64Encode(s, Utilities.Charset.UTF_8); },
-    log: function (level, msg) { console.log('[' + level + '] ' + msg); }
+    log: function (level, msg) { console.log('[' + level + '] ' + msg); },
+    alert: function (subject, body) {
+      try { MailApp.sendEmail(ALERT_EMAIL, subject, body); }
+      catch (e) { console.log('[error] alert could not be sent: ' + (e && e.message)); }
+    }
   };
 }
 
@@ -634,7 +950,12 @@ function relayRun() {
 }
 
 function installRelayTrigger() {
-  removeRelayTriggers();
+  // Only this handler's triggers — removeRelayTriggers() would take the daily
+  // health check with it, and a monitor that silently disappears when you
+  // reinstall the thing it monitors is worse than no monitor.
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'relayRun') { ScriptApp.deleteTrigger(t); }
+  });
   ScriptApp.newTrigger('relayRun').timeBased().everyMinutes(5).create();
   return 'relayRun installed at 5-minute intervals';
 }
@@ -646,6 +967,61 @@ function removeRelayTriggers() {
 
 function relayOn() { props_().setProperty(PROP_RELAY_MODE, 'on'); return 'relay ON (' + ROUTE + ')'; }
 function relayOff() { props_().setProperty(PROP_RELAY_MODE, 'off'); return 'relay OFF (' + ROUTE + ')'; }
+
+/**
+ * Build and send real relayed copies, but addressed to ALERT_EMAIL only.
+ * Everything else — routing, threading, Reply-To, dedup, state — is identical,
+ * so what arrives is exactly what a client would have received. Run in this
+ * mode until you have read one.
+ */
+function relaySelf() { props_().setProperty(PROP_RELAY_MODE, 'self'); return 'relay SELF (' + ROUTE + ') — copies go to ' + ALERT_EMAIL + ' only'; }
+
+/**
+ * Daily. Emails ALERT_EMAIL if anything client-facing is unaccounted for.
+ * Install with installHealthTrigger(). Sends nothing but the alert.
+ */
+function relayHealth() {
+  var store = relayStore_();
+  var nowMs = Date.now();
+
+  // Every client automation this mailbox has sent recently, found by the marker
+  // rather than by subject. If the relay is dead these are exactly the messages
+  // with no state row.
+  var markerMsgs = [];
+  try {
+    var res = Gmail.Users.Messages.list('me', {
+      q: 'in:sent to:' + CLIENT_ROUTE_MARKER + ' newer_than:2d', maxResults: 100
+    });
+    ((res && res.messages) || []).forEach(function (m) {
+      try {
+        var full = Gmail.Users.Messages.get('me', m.id, { format: 'metadata', metadataHeaders: ['Date'] });
+        markerMsgs.push({ id: m.id, ts: Number(full.internalDate || 0) });
+      } catch (e) { /* skip one unreadable message rather than fail the check */ }
+    });
+  } catch (e) {
+    // A search failure must not read as "all clear".
+    MailApp.sendEmail(ALERT_EMAIL, 'G247 relay health: CHECK COULD NOT RUN',
+      'relayHealth() could not search the mailbox: ' + (e && e.message) +
+      '\n\nThe client relay is UNMONITORED until this is fixed.');
+    throw e;
+  }
+
+  var h = healthCheck(store.allRows(), markerMsgs, nowMs);
+  var body = healthMessage(h);
+  console.log(body);
+  if (!h.ok) {
+    MailApp.sendEmail(ALERT_EMAIL, 'G247 relay: client mail unaccounted for', body);
+  }
+  return h;
+}
+
+function installHealthTrigger() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'relayHealth') { ScriptApp.deleteTrigger(t); }
+  });
+  ScriptApp.newTrigger('relayHealth').timeBased().everyDays(1).atHour(8).create();
+  return 'relayHealth installed daily at ~08:00';
+}
 
 /** Scopes, mailbox, ledger access, state sheet, mode. Writes nothing. */
 function relayPreflight() {

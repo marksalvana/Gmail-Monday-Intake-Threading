@@ -202,10 +202,12 @@ function rig(o) {
   const calls = [];
   const cursors = Object.assign({}, o.cursors || {});
   const relayed = new Set(o.relayed || []);
+  const attempts = Object.assign({}, o.attempts || {});
+  const alerts = [];
   const props = { _s: Object.assign({ [S.PROP_RELAY_MODE]: o.mode || 'on' }, o.props || {}),
                   get(k) { return this._s[k]; }, set(k, v) { this._s[k] = v; } };
   return {
-    calls, cursors,
+    calls, cursors, alerts,
     deps: {
       gmail: {
         profile: () => 'projects@group247ww.com',
@@ -214,10 +216,22 @@ function rig(o) {
         messageMeta: (id) => (o.messages || {})[id] || { ok: false, id },
         sendRaw: () => { calls.push('sendRaw'); if (o.sendThrows) { throw new Error(o.sendThrows); } return 'SENT1'; }
       },
-      ledger: { itemThread: () => (o.anchor === undefined ? ANCHOR : o.anchor) },
+      ledger: {
+        itemThread: () => (o.anchor === undefined ? ANCHOR : o.anchor),
+        threadParticipants: () => (o.participants === undefined
+          ? ['client@inovapharma.com', 'msalvana@group247ww.com'] : o.participants)
+      },
       store: {
         hasRelayed: (id) => relayed.has(id),
-        record: (r) => { calls.push('record:' + r.result); relayed.add(r.sourceMessageId); }
+        attemptsFor: (id) => attempts[id] || (relayed.has(id) ? { last: 'sent', failures: 0 } : null),
+        record: (r) => {
+          calls.push('record:' + r.result);
+          relayed.add(r.sourceMessageId);
+          const a = attempts[r.sourceMessageId] || { last: '', failures: 0 };
+          a.last = r.result;
+          if (r.result === 'FAILED') { a.failures++; }
+          attempts[r.sourceMessageId] = a;
+        }
       },
       state: { getCursor: (k) => cursors[k] || '',
                setCursor: (k, v) => { cursors[k] = String(v); } },
@@ -225,7 +239,8 @@ function rig(o) {
       now: () => '2026-08-21T00:00:00.000Z',
       nowMs: () => 1000000,
       b64,
-      log: () => {}
+      log: () => {},
+      alert: (subject, body) => { alerts.push({ subject, body }); }
     }
   };
 }
@@ -334,6 +349,262 @@ check('the window rolls over, and corrupt state fails open', () => {
   const p = fakeProps({ [S.PROP_RELAY_RATE]: JSON.stringify({ windowStart: 1000, count: 99 }) });
   eq(S.relayRateGate(p, 1000 + 3600001, 40, 3600000).allow, true);
   eq(S.relayRateGate(fakeProps({ [S.PROP_RELAY_RATE]: 'junk' }), 5000, 40, 3600000).allow, true);
+});
+
+// ==================================================== CLIENT ROUTE
+suite('Marker routing — telling a client automation from an internal one');
+
+check('THE MARKER OUTRANKS THE DOMAIN RULE', () => {
+  // After the change the client is no longer a recipient, so every address
+  // left looks internal. Without the marker this would route as internal.
+  eq(S.classifyRoute([
+    'pulse-123@g247ww.us.monday.com',
+    'monday-client-relay@group247ww.com',
+    'msalvana@group247ww.com'
+  ]), 'client');
+});
+
+check('without the marker the same recipients are internal', () => {
+  eq(S.classifyRoute([
+    'pulse-123@g247ww.us.monday.com', 'msalvana@group247ww.com'
+  ]), 'internal');
+});
+
+check('the marker alone, with no item address, is still unroutable', () => {
+  eq(S.classifyRoute(['monday-client-relay@group247ww.com']), '');
+});
+
+check('a real external recipient still routes as client', () => {
+  eq(S.classifyRoute([
+    'pulse-123@g247ww.us.monday.com', 'client@inovapharma.com'
+  ]), 'client');
+});
+
+suite('Client recipients — who the relayed copy actually goes to');
+
+check('the client and the PM survive; monday and projects@ do not', () => {
+  eq(S.clientRecipients([
+    'client@inovapharma.com',
+    'projects@group247ww.com',
+    'pulse-123@g247ww.us.monday.com',
+    'monday-client-relay@group247ww.com',
+    'msalvana@group247ww.com'
+  ], 'msalvana@group247ww.com'), ['client@inovapharma.com', 'msalvana@group247ww.com']);
+});
+
+check('automated senders on the thread are never mailed back', () => {
+  eq(S.clientRecipients(
+    ['noreply@monday.com', 'do-not-reply@adobe.com', 'client@inovapharma.com'],
+    'pm@group247ww.com'),
+    ['client@inovapharma.com', 'pm@group247ww.com']);
+});
+
+check('THE PM IS ADDED EVEN IF THE LEDGER LOST THEM', () => {
+  eq(S.clientRecipients(['client@inovapharma.com'], 'pm@group247ww.com'),
+    ['client@inovapharma.com', 'pm@group247ww.com']);
+});
+
+check('the PM is not duplicated when already present', () => {
+  eq(S.clientRecipients(['PM@group247ww.com', 'client@inovapharma.com'], 'pm@group247ww.com'),
+    ['pm@group247ww.com', 'client@inovapharma.com']);
+});
+
+check('an empty ledger list yields the PM alone, never nobody', () => {
+  eq(S.clientRecipients([], 'pm@group247ww.com'), ['pm@group247ww.com']);
+  eq(S.clientRecipients([], ''), []);
+});
+
+suite('Retry — a client who never hears back is the failure that matters');
+
+const CLIENT_MSG = (o) => Object.assign({
+  ok: true, id: 'GM1',
+  addresses: ['pulse-999@g247ww.us.monday.com', 'monday-client-relay@group247ww.com'],
+  subject: 'Project - pls review & approve', syncHeader: '',
+  bodyHtml: '<p>approve?</p>', bodyText: 'approve?'
+}, o || {});
+
+function clientCtx(o) {
+  return Object.assign({
+    route: 'client',
+    anchorFor: () => ANCHOR,
+    participantsFor: () => ['client@inovapharma.com', 'msalvana@group247ww.com']
+  }, o || {});
+}
+
+check('a FAILED client send is retried', () => {
+  const v = S.shouldRelay(CLIENT_MSG(), clientCtx({
+    priorAttempts: { last: 'FAILED', failures: 1 }
+  }));
+  eq(v.relay, true, 'one retry, because not retried means the client never hears');
+});
+
+check('TWO FAILURES IS THE END — never a loop', () => {
+  const v = S.shouldRelay(CLIENT_MSG(), clientCtx({
+    priorAttempts: { last: 'FAILED', failures: 2 }
+  }));
+  eq(v.relay, false);
+  eq(v.reason, 'retries-exhausted');
+});
+
+check('a FAILED INTERNAL send is still not retried', () => {
+  // An internal message: no marker, so it routes internal.
+  const v = S.shouldRelay(MSG(), clientCtx({
+    route: 'internal', priorAttempts: { last: 'FAILED', failures: 1 }
+  }));
+  eq(v.relay, false);
+  eq(v.reason, 'failed-not-retried');
+});
+
+check('"SENDING" IS NEVER RETRIED — the outcome is unknown', () => {
+  // Recorded before the send. If the pass died in between, the message may
+  // already be in the client's inbox and cannot be recalled.
+  const v = S.shouldRelay(CLIENT_MSG(), clientCtx({
+    priorAttempts: { last: 'sending', failures: 0 }
+  }));
+  eq(v.relay, false);
+  eq(v.reason, 'in-flight-outcome-unknown');
+});
+
+check('a sent message is not sent twice', () => {
+  const v = S.shouldRelay(CLIENT_MSG(), clientCtx({
+    priorAttempts: { last: 'sent', failures: 0 }
+  }));
+  eq(v.reason, 'already-relayed');
+});
+
+check('AN EMPTY LEDGER LIST IS A LOUD SKIP, NOT A SEND TO NOBODY', () => {
+  const v = S.shouldRelay(CLIENT_MSG(), clientCtx({
+    anchorFor: () => Object.assign({}, ANCHOR, { mailbox: '' }),
+    participantsFor: () => []
+  }));
+  eq(v.relay, false);
+  // No mailbox and no participants: it fails at the anchor check first, which
+  // is the correct order — an item with no thread has nowhere to go at all.
+  eq(v.reason, 'item-has-no-gmail-thread');
+});
+
+suite('Self mode and the client pass end to end');
+
+check('SELF MODE SENDS TO MARK, NOT THE CLIENT', () => {
+  const r = rig({ mode: 'self', cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  messages: { GM1: CLIENT_MSG() } });
+  const before = S.ROUTE;
+  S.ROUTE = 'client';
+  let raw = '';
+  r.deps.gmail.sendRaw = (x) => { raw = x; return 'SENT1'; };
+  const s = S.runRelayPass(r.deps, {});
+  S.ROUTE = before;
+  eq(s.relayed, 1);
+  truthy(/^To: msalvana@group247ww\.com$/m.test(raw),
+    'the client must not receive anything in self mode — got: ' + raw.split('\r\n')[0]);
+  truthy(r.calls.indexOf('record:sent-self') !== -1,
+    'and it is recorded distinctly so a self copy is never mistaken for a real one');
+});
+
+check('A LIVE CLIENT PASS ADDRESSES THE THREAD AND SETS REPLY-TO', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  messages: { GM1: CLIENT_MSG() } });
+  const before = S.ROUTE;
+  S.ROUTE = 'client';
+  let raw = '';
+  r.deps.gmail.sendRaw = (x) => { raw = x; return 'SENT1'; };
+  S.runRelayPass(r.deps, {});
+  S.ROUTE = before;
+  truthy(/^To: client@inovapharma\.com, msalvana@group247ww\.com$/m.test(raw),
+    'client and PM: ' + raw.split('\r\n')[0]);
+  truthy(/^Reply-To: msalvana@group247ww\.com$/m.test(raw),
+    'a client reply must land in the PM mailbox the intake reads, not projects@');
+  truthy(/^In-Reply-To: <root@client\.example>$/m.test(raw), 'still threaded');
+});
+
+check('the internal route gains no Reply-To and still goes to the PM alone', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  messages: { GM1: MSG() } });
+  let raw = '';
+  r.deps.gmail.sendRaw = (x) => { raw = x; return 'SENT1'; };
+  S.runRelayPass(r.deps, {});
+  truthy(/^To: msalvana@group247ww\.com$/m.test(raw), raw.split('\r\n')[0]);
+  truthy(!/^Reply-To:/m.test(raw),
+    'anchored — "In-Reply-To:" contains "Reply-To:", and an unanchored test ' +
+    'would report a header that is not there');
+});
+
+check('THE CLIENT RATE CAP ALERTS RATHER THAN DEFERRING QUIETLY', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  messages: { GM1: CLIENT_MSG() },
+                  props: { [S.PROP_CLIENT_RATE]:
+                    JSON.stringify({ windowStart: 1000000, count: S.CLIENT_MAX_PER_HOUR }) } });
+  const before = S.ROUTE;
+  S.ROUTE = 'client';
+  const s = S.runRelayPass(r.deps, {});
+  S.ROUTE = before;
+  eq(s.relayed, 0);
+  eq(s.rateCapped, true);
+  eq(r.alerts.length, 1, 'a waiting approval request is not a silent condition');
+});
+
+check('the two routes keep SEPARATE rate budgets', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  messages: { GM1: CLIENT_MSG() },
+                  props: { [S.PROP_RELAY_RATE]:
+                    JSON.stringify({ windowStart: 1000000, count: S.RELAY_MAX_PER_HOUR }) } });
+  const before = S.ROUTE;
+  S.ROUTE = 'client';
+  const s = S.runRelayPass(r.deps, {});
+  S.ROUTE = before;
+  eq(s.relayed, 1, 'internal chatter exhausting its budget must not block a client');
+});
+
+suite('relayHealth — looking for the absence');
+
+check('a clean board reports ok', () => {
+  const h = S.healthCheck(
+    [{ route: 'client', sourceMessageId: 'A', result: 'sent' }],
+    [{ id: 'A', ts: 0 }], 10 * 60 * 60 * 1000);
+  eq(h.ok, true);
+});
+
+check('A SENT AUTOMATION WITH NO ROW AT ALL IS THE DEAD-RELAY SIGNAL', () => {
+  const h = S.healthCheck([], [{ id: 'A', ts: 0 }], S.HEALTH_STALE_MS + 60000);
+  eq(h.ok, false);
+  eq(h.lost.length, 1, 'this is the only check that catches a relay that never ran');
+});
+
+check('a message younger than the window is not yet late', () => {
+  const h = S.healthCheck([], [{ id: 'A', ts: 1000 }], 1000 + S.HEALTH_STALE_MS - 1);
+  eq(h.ok, true);
+  eq(h.lost.length, 0);
+});
+
+check('a row stuck at "sending" is reported', () => {
+  const h = S.healthCheck(
+    [{ route: 'client', sourceMessageId: 'A', result: 'sending' }], [], 0);
+  eq(h.ok, false);
+  eq(h.stuck, [{ sourceMessageId: 'A', result: 'sending' }]);
+});
+
+check('the LAST result for a source wins, so a retry that succeeded is clean', () => {
+  const h = S.healthCheck([
+    { route: 'client', sourceMessageId: 'A', result: 'FAILED' },
+    { route: 'client', sourceMessageId: 'A', result: 'sent' }
+  ], [], 0);
+  eq(h.ok, true);
+});
+
+check('internal rows are not this alert’s business', () => {
+  const h = S.healthCheck(
+    [{ route: 'internal', sourceMessageId: 'A', result: 'FAILED' }], [], 0);
+  eq(h.ok, true);
+});
+
+check('the alert text names the dead-relay case first', () => {
+  const msg = S.healthMessage(S.healthCheck([], [{ id: 'A', ts: 0 }], S.HEALTH_STALE_MS + 1));
+  truthy(/NOT RELAYED AT ALL/.test(msg), msg);
 });
 
 report();
