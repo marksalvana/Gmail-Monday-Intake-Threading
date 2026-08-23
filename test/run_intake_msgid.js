@@ -15,7 +15,7 @@ const S = loadSandbox();
 const REAL_ID = 'CAAcrcBHWZKGNu0BmsZbxMF0diyYSirCc03y1ydvuS_NXt8Gy+g@mail.gmail.com';
 
 function rig() {
-  const staged = { msg: [], thread: [], item: [] };
+  const staged = { msg: [], thread: [], item: [], participants: [] };
   const ctx = {
     mailbox: 'msalvana@group247ww.com',
     candidate: { mid: 'GID1', tid: 'THREAD1' },
@@ -27,6 +27,7 @@ function rig() {
   ctx.message = {
     ok: true, threadId: 'THREAD1', subject: 'New Job 6',
     from: 'Mark <email@marksalvana.com>', senderEmail: 'email@marksalvana.com',
+    to: 'msalvana@group247ww.com', cc: 'sgow@group247ww.com',
     bodyHtml: '<p>hi</p>', bodyText: '', bodyError: '', attachments: [],
     internalDate: '1787456277000', headerMessageId: '<' + REAL_ID + '>'
   };
@@ -34,7 +35,8 @@ function rig() {
     ledger: {
       stageMessage: (r) => staged.msg.push(r),
       stageThreadAnchor: (r) => staged.thread.push(r),
-      stageItemIndex: (r) => staged.item.push(r)
+      stageItemIndex: (r) => staged.item.push(r),
+      stageParticipants: (r) => staged.participants.push(r)
     },
     log: { info: () => {}, warn: () => {}, error: () => {} },
     writer: {
@@ -78,6 +80,42 @@ check('a missing rawMessageId falls back rather than writing undefined', () => {
                 targetGroupId: null, itemName: 'x' }
   }), summary);
   eq(r.staged.item[0].headerMessageId, S.normalizeMessageId(REAL_ID));
+});
+
+suite('Intake — participants are recorded for the outbound relay');
+
+function run(r, classification, extra) {
+  const summary = { created: 0, appended: 0, skipped: 0, errors: 0, deadLettered: 0 };
+  S.applyDecision(r.deps, Object.assign({}, r.ctx, {
+    decision: Object.assign({ classification: classification, targetBoardId: '1',
+                              targetGroupId: null, itemName: 'x',
+                              anchorItemId: '999' }, extra || {})
+  }), summary);
+  return summary;
+}
+
+check('creating a project records who is on the thread', () => {
+  const r = rig();
+  run(r, 'create-matched-board');
+  eq(r.staged.participants.length, 1);
+  eq(r.staged.participants[0].threadId, 'THREAD1');
+  eq(r.staged.participants[0].participants,
+     ['email@marksalvana.com', 'msalvana@group247ww.com', 'sgow@group247ww.com']);
+});
+
+check('A REPLY REFRESHES THE LIST — this is how it stays current', () => {
+  const r = rig();
+  r.ctx.message.cc = 'sgow@group247ww.com, newperson@inovapharma.com';
+  run(r, 'append-to-existing-item');
+  eq(r.staged.participants.length, 1, 'appends record participants too, not just creates');
+  truthy(r.staged.participants[0].participants.indexOf('newperson@inovapharma.com') !== -1,
+    'somebody added to the conversation must appear without any extra Gmail call');
+});
+
+check('a decision NOT to act records no participants', () => {
+  const r = rig();
+  run(r, 'unmatched-no-board');
+  eq(r.staged.participants.length, 0);
 });
 
 report();

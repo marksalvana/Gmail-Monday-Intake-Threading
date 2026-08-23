@@ -793,7 +793,8 @@ function formatUpdateBody(msg, opts) {
 
 var LEDGER_SHEET = 'ledger';
 var LEDGER_HEADERS = ['kind', 'key', 'mondayItemId', 'mailbox', 'threadId',
-  'headerMessageId', 'gmailMessageId', 'boardId', 'subject', 'createdAt', 'source'];
+  'headerMessageId', 'gmailMessageId', 'boardId', 'subject', 'createdAt', 'source',
+  'participants'];
 
 /**
  * RFC 2822 Message-IDs arrive as `<abc@host>` from some headers and bare from
@@ -818,6 +819,33 @@ function bareMessageId(raw) {
   return String(raw || '').trim().replace(/^</, '').replace(/>$/, '');
 }
 
+/**
+ * Every human address on a message, for the participant list.
+ *
+ * Excludes monday's own item addresses: pulse-<id>@... is plumbing, never
+ * somebody you would address a reply to, and leaving it in would mean the
+ * outbound relay mailing monday a copy of monday's own email.
+ *
+ * Order is preserved (From first) so the list reads sensibly to a human opening
+ * the ledger. PURE.
+ */
+function collectParticipants(from, to, cc) {
+  var out = [];
+  var seen = {};
+  [from, to, cc].forEach(function (v) {
+    var re = /[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}/gi;
+    var m;
+    while ((m = re.exec(String(v || ''))) !== null) {
+      var a = m[0].toLowerCase();
+      if (/^pulse-\d+@[a-z0-9.\-]*monday\.com$/i.test(a)) { continue; }
+      if (seen[a]) { continue; }
+      seen[a] = true;
+      out.push(a);
+    }
+  });
+  return out;
+}
+
 function normalizeMessageId(raw) {
   return String(raw || '')
     .trim()
@@ -840,6 +868,7 @@ function createLedger(adapter) {
     var byThread = {};
     var byItem = {};
     var byUpdate = {};
+    var byParticipants = {};
 
     rows.forEach(function (r) {
       if (!r || !r.kind) { return; }
@@ -847,10 +876,16 @@ function createLedger(adapter) {
       else if (r.kind === 'thread') { byThread[String(r.key)] = r; }
       else if (r.kind === 'item') { byItem[String(r.key)] = r; }
       else if (r.kind === 'sent') { byUpdate[String(r.key)] = r; }
+      // LAST ONE WINS, deliberately. Participant rows are appended, never
+      // updated — the ledger has no update path and adding one would mean
+      // finding and rewriting a row under a lock. Appending a fresh row on
+      // every reply and taking the newest is simpler and cannot half-succeed.
+      else if (r.kind === 'participants') { byParticipants[String(r.key)] = r; }
     });
 
     index = { byMessage: byMessage, byThread: byThread, byItem: byItem,
-              byUpdate: byUpdate, rowCount: rows.length };
+              byUpdate: byUpdate, byParticipants: byParticipants,
+              rowCount: rows.length };
     return index;
   }
 
@@ -908,6 +943,46 @@ function createLedger(adapter) {
       };
       buffer.push(row);
       ensureLoaded().byUpdate[row.key] = row;
+      return row;
+    },
+
+    /**
+     * Who is on this Gmail thread, newest list first written.
+     *
+     * The outbound relay runs as projects@group247ww.com and CANNOT read the
+     * thread — it lives in the PM's mailbox. So the intake, which does run as
+     * the PM, records the participants here and the relay reads them from the
+     * ledger. Refreshed on every append, which is exactly when somebody joins
+     * or leaves a conversation.
+     */
+    threadParticipants: function (threadId) {
+      if (!threadId) { return []; }
+      var hit = ensureLoaded().byParticipants[String(threadId)];
+      if (!hit || !hit.participants) { return []; }
+      return String(hit.participants).split(',').map(function (a) {
+        return a.trim().toLowerCase();
+      }).filter(function (a) { return !!a; });
+    },
+
+    /** Append the current participant list for a thread. */
+    stageParticipants: function (rec) {
+      var list = rec.participants || [];
+      var row = {
+        kind: 'participants',
+        key: String(rec.threadId || ''),
+        mondayItemId: String(rec.mondayItemId || ''),
+        mailbox: rec.mailbox || '',
+        threadId: String(rec.threadId || ''),
+        headerMessageId: '',
+        gmailMessageId: rec.gmailMessageId || '',
+        boardId: rec.boardId || '',
+        subject: rec.subject || '',
+        createdAt: rec.createdAt || '',
+        source: 'apps-script',
+        participants: list.join(', ')
+      };
+      buffer.push(row);
+      if (row.key) { ensureLoaded().byParticipants[row.key] = row; }
       return row;
     },
 
@@ -1178,6 +1253,30 @@ function createSheetAdapter(spreadsheetId) {
       if (headers && headers.length) {
         sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
         sh.setFrozenRows(1);
+      }
+      return sh;
+    }
+
+    // AN EXISTING SHEET MAY PREDATE A COLUMN.
+    //
+    // Rows are written by mapping LEDGER_HEADERS to an array, so once a header
+    // is added the writer emits one more value per row. If the sheet's header
+    // row still has the old width, that value lands in a column with no label —
+    // and readAll(), which keys by the header row, would never expose it. The
+    // data would be written and silently unreadable, which is this project's
+    // favourite kind of bug.
+    //
+    // So: append any missing headers, in order, before anything is written.
+    // Idempotent, one row read per run, and it removes the need for anyone to
+    // remember a migration step.
+    if (headers && headers.length) {
+      var width = Math.max(sh.getLastColumn(), 1);
+      var existing = sh.getRange(1, 1, 1, width).getValues()[0]
+        .map(function (h) { return String(h || ''); });
+      var missing = headers.filter(function (h) { return existing.indexOf(h) === -1; });
+      if (missing.length) {
+        sh.getRange(1, existing.length + 1, 1, missing.length)
+          .setValues([missing]).setFontWeight('bold');
       }
     }
     return sh;
@@ -1722,6 +1821,12 @@ function applyDecision(deps, ctx, summary) {
     deps.ledger.stageMessage(common);
     deps.ledger.stageThreadAnchor(common);
     deps.ledger.stageItemIndex(common);
+    deps.ledger.stageParticipants({
+      threadId: msg.threadId, mondayItemId: created.itemId, mailbox: ctx.mailbox,
+      gmailMessageId: ctx.candidate.mid, boardId: d.targetBoardId,
+      subject: msg.subject, createdAt: ctx.now(),
+      participants: collectParticipants(msg.from, msg.to, msg.cc)
+    });
     summary.created++;
 
   } else if (d.classification === 'append-to-existing-item') {
@@ -1743,6 +1848,15 @@ function applyDecision(deps, ctx, summary) {
       threadId: msg.threadId, headerMessageId: ctx.headerMessageId,
       gmailMessageId: ctx.candidate.mid, boardId: d.targetBoardId,
       subject: msg.subject, createdAt: ctx.now()
+    });
+    // Refresh the participant list. A reply is the moment somebody is added to
+    // or dropped from a conversation, so this is the cheapest place to keep it
+    // current — no extra Gmail call, the message is already fetched.
+    deps.ledger.stageParticipants({
+      threadId: msg.threadId, mondayItemId: d.anchorItemId, mailbox: ctx.mailbox,
+      gmailMessageId: ctx.candidate.mid, boardId: d.targetBoardId,
+      subject: msg.subject, createdAt: ctx.now(),
+      participants: collectParticipants(msg.from, msg.to, msg.cc)
     });
     summary.appended++;
 
@@ -3412,7 +3526,8 @@ var EXPECTED_SYMBOLS = [
   ['20_Classifier.gs', ['classifyMessage']],
   ['30_ColumnValues.gs', ['buildColumnValues']],
   ['35_UpdateBody.gs', ['toMondayDateTime', 'formatUpdateBody', 'escapeHtml']],
-  ['40_Store.gs', ['createLedger', 'normalizeMessageId', 'bareMessageId', 'LEDGER_HEADERS']],
+  ['40_Store.gs', ['createLedger', 'normalizeMessageId', 'bareMessageId',
+    'collectParticipants', 'LEDGER_HEADERS']],
   ['45_RunLog.gs', ['createRunLog', 'RUNLOG_HEADERS']],
   ['50_SheetAdapter.gs', ['createSheetAdapter']],
   ['55_Migration.gs', ['importMakeLedger', 'previewMakeLedgerImport',

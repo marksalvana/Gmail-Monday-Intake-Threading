@@ -4,6 +4,6 @@
   "private": true,
   "description": "Gmail <-> monday.com bridge for G247, on Google Apps Script. Tests run against Code.gs itself \u2014 the exact file pasted into the editor.",
   "scripts": {
-    "test": "node test/run_outbound.js && node test/run_intake_msgid.js"
+    "test": "node test/run_outbound.js && node test/run_intake_msgid.js && node test/run_participants.js"
   }
 }
