@@ -3404,6 +3404,109 @@ function backfillParticipants_(dryRun) {
   return out;
 }
 
+/**
+ * WOULD CLIENT THREADING ACTUALLY REACH THE CLIENT?
+ *
+ * The client relay addresses a thread's participants. That only delivers to a
+ * client who is ON the thread — and the 23 August backfill suggested most G247
+ * threads are internal-only, with the client reachable solely through monday's
+ * Group Email column. On those projects, switching the automations over would
+ * send the approval request to G247 staff and nobody else, and report success.
+ *
+ * This counts that, so the decision is made from the full ledger rather than
+ * from ten sample lines in a screenshot.
+ *
+ * "External" here means what the RELAY means by it: not @group247ww.com, not
+ * monday's own address, not an automated sender. A thread whose only outsider
+ * is mailer-daemon has no client on it.
+ *
+ * Writes nothing.
+ */
+
+/**
+ * MUST MATCH Relay.gs. These are duplicated across two script projects that
+ * cannot share code, so if the relay's filtering changes and this does not,
+ * the audit will overstate coverage — it would report clients reachable who
+ * are not. Change both or neither.
+ */
+var AUDIT_INTERNAL_DOMAINS = ['group247ww.com'];
+var AUDIT_RECIPIENT_BLOCKLIST = ['noreply', 'no-reply', 'donotreply', 'do-not-reply',
+  'mailer-daemon', 'postmaster', 'bounce', 'notifications'];
+
+/** Is this address a real outside human? PURE. */
+function isReachableClientAddress(addr) {
+  var a = String(addr || '').trim().toLowerCase();
+  if (!a) { return false; }
+  if (/^pulse-\d+@[a-z0-9.\-]*monday\.com$/i.test(a)) { return false; }
+  for (var i = 0; i < AUDIT_INTERNAL_DOMAINS.length; i++) {
+    if (a.slice(-(AUDIT_INTERNAL_DOMAINS[i].length + 1)) === '@' + AUDIT_INTERNAL_DOMAINS[i]) {
+      return false;
+    }
+  }
+  var local = a.split('@')[0];
+  for (var j = 0; j < AUDIT_RECIPIENT_BLOCKLIST.length; j++) {
+    if (local.indexOf(AUDIT_RECIPIENT_BLOCKLIST[j]) !== -1) { return false; }
+  }
+  return true;
+}
+
+function participantsAudit() {
+  var sh = SpreadsheetApp.openById(LEDGER_SPREADSHEET_ID).getSheetByName(LEDGER_SHEET);
+  if (!sh) { throw new Error('ledger sheet not found'); }
+  var values = sh.getDataRange().getValues();
+  var col = {};
+  values[0].forEach(function (h, i) { col[String(h)] = i; });
+  if (col.participants === undefined) {
+    throw new Error('the ledger has no "participants" column — paste the current Code.gs first');
+  }
+
+  // Item rows carry the monday item id per thread; participants rows carry who.
+  var itemForThread = {};
+  var subjectForThread = {};
+  var parts = {};
+  for (var r = 1; r < values.length; r++) {
+    var kind = String(values[r][col.kind] || '');
+    var tid = String(values[r][col.threadId] || '');
+    if (!tid) { continue; }
+    if (kind === 'item') {
+      itemForThread[tid] = String(values[r][col.mondayItemId] || '');
+      subjectForThread[tid] = String(values[r][col.subject] || '');
+    } else if (kind === 'participants') {
+      parts[tid] = String(values[r][col.participants] || '');
+    }
+  }
+
+  var out = { threadsWithParticipants: 0, wouldReachClient: 0, internalOnly: 0,
+              noParticipantsRow: 0, reachable: [], internalOnlyList: [] };
+
+  Object.keys(itemForThread).forEach(function (tid) {
+    var raw = parts[tid];
+    if (raw === undefined) { out.noParticipantsRow++; return; }
+    out.threadsWithParticipants++;
+    var externals = String(raw).split(',').map(function (a) { return a.trim().toLowerCase(); })
+      .filter(isReachableClientAddress);
+    var label = 'item ' + (itemForThread[tid] || '?') + '  ' +
+      String(subjectForThread[tid] || '').slice(0, 48);
+    if (externals.length) {
+      out.wouldReachClient++;
+      if (out.reachable.length < 40) { out.reachable.push(label + '  ->  ' + externals.join(', ')); }
+    } else {
+      out.internalOnly++;
+      if (out.internalOnlyList.length < 40) { out.internalOnlyList.push(label); }
+    }
+  });
+
+  var total = out.wouldReachClient + out.internalOnly;
+  out.verdict = total
+    ? out.wouldReachClient + ' of ' + total + ' projects have a client on the Gmail ' +
+      'thread. The other ' + out.internalOnly + ' would receive NOTHING if the monday ' +
+      'automations were switched to participant addressing.'
+    : 'no projects with participants recorded yet — run backfillParticipants first';
+
+  console.log(JSON.stringify(out, null, 2));
+  return out;
+}
+
 /** off | self | thread. Unset means off — turning it on must be deliberate. */
 function setBridgeModeOff() { return setBridgeMode_('off'); }
 function setBridgeModeSelf() { return setBridgeMode_('self'); }
@@ -3668,7 +3771,8 @@ var EXPECTED_SYMBOLS = [
   ['30_ColumnValues.gs', ['buildColumnValues']],
   ['35_UpdateBody.gs', ['toMondayDateTime', 'formatUpdateBody', 'escapeHtml']],
   ['40_Store.gs', ['createLedger', 'normalizeMessageId', 'bareMessageId',
-    'collectParticipants', 'LEDGER_HEADERS', 'backfillParticipants']],
+    'collectParticipants', 'LEDGER_HEADERS', 'backfillParticipants',
+    'participantsAudit', 'isReachableClientAddress']],
   ['45_RunLog.gs', ['createRunLog', 'RUNLOG_HEADERS']],
   ['50_SheetAdapter.gs', ['createSheetAdapter']],
   ['55_Migration.gs', ['importMakeLedger', 'previewMakeLedgerImport',

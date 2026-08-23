@@ -374,4 +374,66 @@ check('a ledger with NO participants column refuses to run', () => {
     'an older paste must be fixed by pasting, not by a repair inventing a column — got: ' + threw);
 });
 
+/* ------------------------------------------------------------------
+ * The audit. This is the number the go/no-go decision rests on, so the
+ * definition of "would reach a client" has to match the relay's exactly —
+ * an address the relay filters out is not a client the audit may count.
+ * ---------------------------------------------------------------- */
+
+suite('participantsAudit — how many projects would actually reach a client');
+
+check('a real outside human counts', () => {
+  eq(S.isReachableClientAddress('n.adroja@inovapharma.com'), true);
+  eq(S.isReachableClientAddress('marketing@pageproof.com'), true);
+});
+
+check('OUR OWN PEOPLE DO NOT COUNT', () => {
+  eq(S.isReachableClientAddress('msalvana@group247ww.com'), false);
+  eq(S.isReachableClientAddress('inova_websites@group247ww.com'), false);
+});
+
+check('AUTOMATED SENDERS DO NOT COUNT — this is the one that inflates coverage', () => {
+  // Both of these were live in the 23 Aug backfill. An audit that counted them
+  // would report clients reachable who are not.
+  eq(S.isReachableClientAddress('mailer-daemon@googlemail.com'), false);
+  eq(S.isReachableClientAddress('notifications@monday.com'), false);
+});
+
+check("monday's own item address does not count", () => {
+  eq(S.isReachableClientAddress('pulse-12872173573@g247ww.us.monday.com'), false);
+  eq(S.isReachableClientAddress(''), false);
+});
+
+check('THE AUDIT SPLITS REACHABLE FROM INTERNAL-ONLY', () => {
+  const ssObj = ledgerSheetWith([
+    { kind: 'item', threadId: 'T1', mondayItemId: '1', subject: 'Has a client' },
+    { kind: 'participants', threadId: 'T1', participants: 'msalvana@group247ww.com, n.adroja@inovapharma.com' },
+    { kind: 'item', threadId: 'T2', mondayItemId: '2', subject: 'Internal only' },
+    { kind: 'participants', threadId: 'T2', participants: 'msalvana@group247ww.com, dnoble@group247ww.com' },
+    { kind: 'item', threadId: 'T3', mondayItemId: '3', subject: 'Only a daemon' },
+    { kind: 'participants', threadId: 'T3', participants: 'msalvana@group247ww.com, mailer-daemon@googlemail.com' }
+  ]);
+  let res;
+  withFakeSpreadsheet(ssObj, () => {
+    S.LEDGER_SPREADSHEET_ID = 'x';
+    res = S.participantsAudit();
+  });
+  eq(res.wouldReachClient, 1);
+  eq(res.internalOnly, 2, 'a thread whose only outsider is a daemon has no client on it');
+});
+
+check('a thread with no participants row is counted separately, not as a pass', () => {
+  const ssObj = ledgerSheetWith([
+    { kind: 'item', threadId: 'T1', mondayItemId: '1', subject: 'Never backfilled' }
+  ]);
+  let res;
+  withFakeSpreadsheet(ssObj, () => {
+    S.LEDGER_SPREADSHEET_ID = 'x';
+    res = S.participantsAudit();
+  });
+  eq(res.noParticipantsRow, 1);
+  eq(res.wouldReachClient, 0);
+  truthy(/run backfillParticipants first/.test(res.verdict), res.verdict);
+});
+
 report();
