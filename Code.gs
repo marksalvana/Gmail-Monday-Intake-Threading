@@ -3603,6 +3603,10 @@ function verifyInstall() {
       notes.push('Make snapshot looks wrong: ' + MAKE_MSG_ROWS.length + ' msg / ' +
         MAKE_THREAD_ROWS.length + ' thread / ' + MAKE_ITEM_ROWS.length + ' item (expected 29/13/5)');
     }
+    if (LEDGER_HEADERS.indexOf('participants') === -1) {
+      notes.push('LEDGER_HEADERS has no "participants" column — this is an older ' +
+        'paste, and the outbound relay would have no way to learn who is on a thread');
+    }
     if (INTEGRATION_USER_IDS.indexOf(37824531) === -1) {
       notes.push('37824531 (David Noble, the legacy Make identity) is missing from ' +
         'INTEGRATION_USER_IDS — the bridge would echo its own writes during the parallel run');
