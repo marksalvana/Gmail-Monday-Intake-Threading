@@ -981,6 +981,20 @@ function relaySelf() { props_().setProperty(PROP_RELAY_MODE, 'self'); return 're
  * Install with installHealthTrigger(). Sends nothing but the alert.
  */
 function relayHealth() {
+  // ROUTE-GUARDED, and it must be.
+  //
+  // The check looks for marker messages with no state row and calls them lost.
+  // On the INTERNAL deployment that is EVERY client message by definition —
+  // internal never relays them and never records them — so an unguarded check
+  // installed here would email an alert about every healthy client send. An
+  // alert channel that cries wolf daily is worse than no alert at all, because
+  // the real one arrives into a folder nobody opens.
+  if (ROUTE !== 'client') {
+    console.log('relayHealth is a CLIENT-route check and does nothing on the ' +
+      ROUTE + ' deployment. Remove this trigger here; install it on CLIENT.');
+    return { ok: true, skipped: 'not-the-client-route' };
+  }
+
   var store = relayStore_();
   var nowMs = Date.now();
 
@@ -1019,6 +1033,10 @@ function installHealthTrigger() {
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (t.getHandlerFunction() === 'relayHealth') { ScriptApp.deleteTrigger(t); }
   });
+  if (ROUTE !== 'client') {
+    return 'NOT INSTALLED — relayHealth only makes sense on the CLIENT ' +
+      'deployment. Any existing health trigger in this project has been removed.';
+  }
   ScriptApp.newTrigger('relayHealth').timeBased().everyDays(1).atHour(8).create();
   return 'relayHealth installed daily at ~08:00';
 }
