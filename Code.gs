@@ -1569,7 +1569,21 @@ function runIntake(deps, opts) {
     var decision = null;
     try {
       var msg = deps.gmail.messagesGet(cand.mid);
+
+      // TWO FORMS OF THE SAME ID, AND THEY ARE NOT INTERCHANGEABLE.
+      //
+      // headerMessageId is lowercased and is the DEDUP KEY: both sides of a
+      // comparison get flattened, so it matches, and every ledger key ever
+      // written uses this form.
+      //
+      // rawMessageId keeps the case Gmail gave us and is what goes back into an
+      // RFC 2822 header. Message-ID local parts are case-sensitive, so the
+      // outbound relay's In-Reply-To must carry this one. Flattening it here is
+      // what made relayed mail start a new conversation instead of joining the
+      // project thread — and it was invisible for weeks because dedup, which
+      // uses the other form, kept working perfectly.
       var headerMessageId = normalizeMessageId(msg.headerMessageId);
+      var rawMessageId = bareMessageId(msg.headerMessageId);
 
       decision = classifyMessage({
         fetchOk: !!msg.ok,
@@ -1615,7 +1629,8 @@ function runIntake(deps, opts) {
 
       applyDecision(deps, {
         mailbox: mailbox, candidate: cand, message: msg,
-        headerMessageId: headerMessageId, decision: decision, now: now
+        headerMessageId: headerMessageId, rawMessageId: rawMessageId,
+        decision: decision, now: now
       }, summary);
 
     } catch (e) {
@@ -1694,9 +1709,13 @@ function applyDecision(deps, ctx, summary) {
       nowIso: ctx.now()
     });
 
+    // stageMessage re-normalises for its key, so the raw form here is safe for
+    // all three: the msg row still gets a lowercased key, while the thread and
+    // item rows keep the case the relay needs.
     var common = {
       mondayItemId: created.itemId, mailbox: ctx.mailbox,
-      threadId: msg.threadId, headerMessageId: ctx.headerMessageId,
+      threadId: msg.threadId,
+      headerMessageId: ctx.rawMessageId || ctx.headerMessageId,
       gmailMessageId: ctx.candidate.mid, boardId: d.targetBoardId,
       subject: msg.subject, createdAt: ctx.now()
     };
