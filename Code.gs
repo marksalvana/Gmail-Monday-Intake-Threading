@@ -3285,6 +3285,125 @@ function repairLedgerMessageIds_(dryRun) {
   return out;
 }
 
+/**
+ * BACKFILL THE PARTICIPANTS COLUMN.
+ *
+ * The live writer records participants on create and rewrites them on every
+ * append, so the column fills FORWARD ONLY. Every thread already in the ledger
+ * when the column shipped has nothing in it — and the CLIENT relay takes its
+ * entire recipient list from that column. Without this, the relay would run on
+ * those threads, log a clean pass, and address nobody: a silent discard that
+ * reads as success, which is this project's signature failure.
+ *
+ * Semantics deliberately MIRROR THE LIVE WRITER rather than improve on it.
+ * The live writer stores the LAST message's From/To/Cc, so this stores the last
+ * message's too. Taking the union of every message in the thread was the
+ * tempting alternative and is wrong: someone dropped from a conversation would
+ * be silently re-added to it, and the backfilled rows would not match the rows
+ * written either side of them.
+ *
+ * Threads that already have a participants row are skipped — a live row is
+ * fresher than anything reconstructed here, and must never be clobbered by a
+ * repair.
+ *
+ * Runs as the PM, in the PM's mailbox: each PM runs it once for their own
+ * threads. A thread belonging to somebody else cannot be read from here and is
+ * counted as notMine, not as a failure.
+ */
+function backfillParticipants() { return backfillParticipants_(false); }
+function backfillParticipantsPreview() { return backfillParticipants_(true); }
+
+var BACKFILL_MAX_THREADS = 200;
+
+function backfillParticipants_(dryRun) {
+  var sh = SpreadsheetApp.openById(LEDGER_SPREADSHEET_ID).getSheetByName(LEDGER_SHEET);
+  if (!sh) { throw new Error('ledger sheet not found'); }
+  var values = sh.getDataRange().getValues();
+  var col = {};
+  values[0].forEach(function (h, i) { col[String(h)] = i; });
+
+  if (col.participants === undefined) {
+    throw new Error('the ledger has no "participants" column. Paste the current ' +
+      'Code.gs and run verifyInstall first — runLive creates the column on its ' +
+      'next pass, and this repair must not create it by hand.');
+  }
+
+  var out = { dryRun: !!dryRun, threads: 0, alreadyHave: 0, wrote: 0,
+              notMine: 0, empty: 0, remaining: 0, samples: [] };
+
+  // Distinct threads that need one, in ledger order, newest row wins nothing —
+  // presence is all that matters here.
+  var need = [];
+  var seen = {};
+  var have = {};
+  for (var r = 1; r < values.length; r++) {
+    var kind = String(values[r][col.kind] || '');
+    var threadId = String(values[r][col.threadId] || '');
+    if (!threadId) { continue; }
+    if (kind === 'participants') { have[threadId] = true; continue; }
+    if (kind !== 'thread' && kind !== 'item') { continue; }
+    if (seen[threadId]) { continue; }
+    seen[threadId] = true;
+    need.push({ threadId: threadId, mondayItemId: String(values[r][col.mondayItemId] || ''),
+                mailbox: String(values[r][col.mailbox] || ''),
+                boardId: String(values[r][col.boardId] || ''),
+                subject: String(values[r][col.subject] || '') });
+  }
+
+  var pending = need.filter(function (n) {
+    if (have[n.threadId]) { out.alreadyHave++; return false; }
+    return true;
+  });
+
+  if (pending.length > BACKFILL_MAX_THREADS) {
+    out.remaining = pending.length - BACKFILL_MAX_THREADS;
+    pending = pending.slice(0, BACKFILL_MAX_THREADS);
+  }
+
+  var ledger = createLedger(createSheetAdapter(LEDGER_SPREADSHEET_ID));
+
+  pending.forEach(function (n) {
+    out.threads++;
+    var last = null;
+    try {
+      var t = Gmail.Users.Threads.get('me', n.threadId, {
+        format: 'metadata', metadataHeaders: ['From', 'To', 'Cc']
+      });
+      var msgs = (t && t.messages) || [];
+      last = msgs.length ? msgs[msgs.length - 1] : null;
+    } catch (e) {
+      out.notMine++;
+      return;
+    }
+    if (!last) { out.notMine++; return; }
+
+    var h = {};
+    ((last.payload && last.payload.headers) || []).forEach(function (x) {
+      h[String(x.name).toLowerCase()] = x.value || '';
+    });
+
+    var list = collectParticipants(h.from, h.to, h.cc);
+    if (!list.length) { out.empty++; return; }
+
+    out.wrote++;
+    if (out.samples.length < 10) {
+      out.samples.push(n.threadId + ' -> ' + list.join(', '));
+    }
+    if (!dryRun) {
+      ledger.stageParticipants({
+        threadId: n.threadId, mondayItemId: n.mondayItemId, mailbox: n.mailbox,
+        boardId: n.boardId, subject: n.subject, gmailMessageId: last.id || '',
+        createdAt: new Date().toISOString(), participants: list
+      });
+    }
+  });
+
+  if (!dryRun) { ledger.flush(); }
+
+  console.log(JSON.stringify(out, null, 2));
+  return out;
+}
+
 /** off | self | thread. Unset means off — turning it on must be deliberate. */
 function setBridgeModeOff() { return setBridgeMode_('off'); }
 function setBridgeModeSelf() { return setBridgeMode_('self'); }
@@ -3549,7 +3668,7 @@ var EXPECTED_SYMBOLS = [
   ['30_ColumnValues.gs', ['buildColumnValues']],
   ['35_UpdateBody.gs', ['toMondayDateTime', 'formatUpdateBody', 'escapeHtml']],
   ['40_Store.gs', ['createLedger', 'normalizeMessageId', 'bareMessageId',
-    'collectParticipants', 'LEDGER_HEADERS']],
+    'collectParticipants', 'LEDGER_HEADERS', 'backfillParticipants']],
   ['45_RunLog.gs', ['createRunLog', 'RUNLOG_HEADERS']],
   ['50_SheetAdapter.gs', ['createSheetAdapter']],
   ['55_Migration.gs', ['importMakeLedger', 'previewMakeLedgerImport',

@@ -122,6 +122,13 @@ function fakeSpreadsheet(sheets) {
       grid: grid,
       frozen: 0,
       getLastColumn: function () { return grid.length ? grid[0].length : 0; },
+      getLastRow: function () { return grid.length; },
+      getDataRange: function () {
+        var self = this;
+        var w = grid.reduce(function (m, r) { return Math.max(m, r.length); }, 0);
+        return self.getRange(1, 1, Math.max(grid.length, 1), Math.max(w, 1));
+      },
+      appendRow: function (row) { grid.push(row.slice()); },
       setFrozenRows: function (n) { this.frozen = n; },
       getRange: function (row, col, nRows, nCols) {
         return {
@@ -163,7 +170,32 @@ function fakeSpreadsheet(sheets) {
 
 function withFakeSpreadsheet(ssObj, fn) {
   S.SpreadsheetApp = { openById: function () { return ssObj; } };
-  try { return fn(); } finally { delete S.SpreadsheetApp; }
+  S.LockService = {
+    getScriptLock: function () {
+      return { tryLock: function () { return true; }, releaseLock: function () {} };
+    }
+  };
+  try { return fn(); } finally { delete S.SpreadsheetApp; delete S.LockService; }
+}
+
+/** Gmail stub: threadId -> last message's headers, or null for "not my mailbox". */
+function withFakeGmail(threads, fn) {
+  S.Gmail = {
+    Users: {
+      Threads: {
+        get: function (who, threadId) {
+          var t = threads[threadId];
+          if (!t) { throw new Error('not found'); }
+          return { messages: t.map(function (m, i) {
+            return { id: 'm' + i, payload: { headers: Object.keys(m).map(function (k) {
+              return { name: k, value: m[k] };
+            }) } };
+          }) };
+        }
+      }
+    }
+  };
+  try { return fn(); } finally { delete S.Gmail; }
 }
 
 suite('Ledger sheet — the header patch');
@@ -219,6 +251,127 @@ check('a missing sheet is still created with the full header row', () => {
     S.createSheetAdapter('x').ensureSheet('ledger', S.LEDGER_HEADERS);
   });
   eq(ssObj.sheets.ledger.grid[0], S.LEDGER_HEADERS);
+});
+
+/* ------------------------------------------------------------------
+ * The backfill. The column fills forward only, so every thread already in
+ * the ledger is empty — and the CLIENT relay's whole recipient list comes
+ * from that column. These assertions are about the relay having somebody
+ * to address on the projects that already exist.
+ * ---------------------------------------------------------------- */
+
+suite('Backfill — filling the column for threads that predate it');
+
+function ledgerSheetWith(rows) {
+  const ssObj = fakeSpreadsheet({ ledger: S.LEDGER_HEADERS.slice() });
+  rows.forEach((r) => {
+    ssObj.sheets.ledger.appendRow(S.LEDGER_HEADERS.map((h) => (r[h] === undefined ? '' : r[h])));
+  });
+  return ssObj;
+}
+
+function runBackfill(ssObj, threads, dry) {
+  let res;
+  withFakeSpreadsheet(ssObj, () => {
+    withFakeGmail(threads, () => {
+      S.LEDGER_SPREADSHEET_ID = 'x';
+      res = dry ? S.backfillParticipantsPreview() : S.backfillParticipants();
+    });
+  });
+  return res;
+}
+
+function participantsRows(ssObj) {
+  const grid = ssObj.sheets.ledger.grid;
+  const ki = S.LEDGER_HEADERS.indexOf('kind');
+  const pi = S.LEDGER_HEADERS.indexOf('participants');
+  const ti = S.LEDGER_HEADERS.indexOf('threadId');
+  return grid.slice(1).filter((r) => r[ki] === 'participants')
+    .map((r) => ({ threadId: r[ti], participants: r[pi] }));
+}
+
+check('A THREAD WITH NO PARTICIPANTS ROW GETS ONE', () => {
+  const ssObj = ledgerSheetWith([{ kind: 'thread', threadId: 'T1', mondayItemId: '9' }]);
+  const res = runBackfill(ssObj, {
+    T1: [{ From: 'client@inova.com', To: 'pm@group247ww.com' }]
+  }, false);
+  eq(res.wrote, 1);
+  eq(participantsRows(ssObj), [{ threadId: 'T1', participants: 'client@inova.com, pm@group247ww.com' }]);
+});
+
+check('IT MIRRORS THE LIVE WRITER — the LAST message, not the union', () => {
+  // Someone dropped from a conversation must stay dropped. A union would
+  // silently re-add them, and the backfilled row would not match the rows
+  // written either side of it.
+  const ssObj = ledgerSheetWith([{ kind: 'thread', threadId: 'T1', mondayItemId: '9' }]);
+  runBackfill(ssObj, {
+    T1: [
+      { From: 'client@inova.com', To: 'pm@group247ww.com', Cc: 'leaver@inova.com' },
+      { From: 'pm@group247ww.com', To: 'client@inova.com' }
+    ]
+  }, false);
+  eq(participantsRows(ssObj), [{ threadId: 'T1', participants: 'pm@group247ww.com, client@inova.com' }]);
+});
+
+check('a thread that ALREADY has a row is never clobbered', () => {
+  const ssObj = ledgerSheetWith([
+    { kind: 'thread', threadId: 'T1', mondayItemId: '9' },
+    { kind: 'participants', threadId: 'T1', participants: 'live@inova.com' }
+  ]);
+  const res = runBackfill(ssObj, { T1: [{ From: 'stale@inova.com' }] }, false);
+  eq(res.alreadyHave, 1);
+  eq(res.wrote, 0, 'a live row is fresher than anything a repair reconstructs');
+  eq(participantsRows(ssObj), [{ threadId: 'T1', participants: 'live@inova.com' }]);
+});
+
+check("a thread in SOMEONE ELSE'S mailbox is notMine, not a failure", () => {
+  const ssObj = ledgerSheetWith([{ kind: 'thread', threadId: 'T9', mondayItemId: '9' }]);
+  const res = runBackfill(ssObj, {}, false);
+  eq(res.notMine, 1);
+  eq(res.wrote, 0);
+  eq(participantsRows(ssObj), [], 'each PM backfills their own threads');
+});
+
+check('THE PREVIEW WRITES NOTHING — a dry run that changes state is a lie', () => {
+  const ssObj = ledgerSheetWith([{ kind: 'thread', threadId: 'T1', mondayItemId: '9' }]);
+  const res = runBackfill(ssObj, { T1: [{ From: 'client@inova.com' }] }, true);
+  eq(res.dryRun, true);
+  eq(res.wrote, 1, 'it still reports what it would have done');
+  eq(participantsRows(ssObj), [], 'and the sheet is untouched');
+});
+
+check('one thread, many ledger rows, ONE participants row', () => {
+  const ssObj = ledgerSheetWith([
+    { kind: 'thread', threadId: 'T1', mondayItemId: '9' },
+    { kind: 'item', threadId: 'T1', mondayItemId: '9' },
+    { kind: 'message', threadId: 'T1', mondayItemId: '9' }
+  ]);
+  const res = runBackfill(ssObj, { T1: [{ From: 'a@b.com' }] }, false);
+  eq(res.threads, 1, 'threads are deduped before any Gmail call is made');
+  eq(participantsRows(ssObj).length, 1);
+});
+
+check('monday’s own address is excluded here too', () => {
+  const ssObj = ledgerSheetWith([{ kind: 'thread', threadId: 'T1', mondayItemId: '9' }]);
+  runBackfill(ssObj, {
+    T1: [{ From: 'client@inova.com', To: 'pulse-12872173573@g247ww.us.monday.com' }]
+  }, false);
+  eq(participantsRows(ssObj), [{ threadId: 'T1', participants: 'client@inova.com' }]);
+});
+
+check('a ledger with NO participants column refuses to run', () => {
+  const old = S.LEDGER_HEADERS.slice(0, S.LEDGER_HEADERS.length - 1);
+  const ssObj = fakeSpreadsheet({ ledger: old });
+  ssObj.sheets.ledger.appendRow(old.map(() => ''));
+  let threw = '';
+  withFakeSpreadsheet(ssObj, () => {
+    withFakeGmail({}, () => {
+      S.LEDGER_SPREADSHEET_ID = 'x';
+      try { S.backfillParticipants(); } catch (e) { threw = e.message; }
+    });
+  });
+  truthy(/verifyInstall/.test(threw),
+    'an older paste must be fixed by pasting, not by a repair inventing a column — got: ' + threw);
 });
 
 report();
