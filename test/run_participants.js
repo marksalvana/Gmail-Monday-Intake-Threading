@@ -106,4 +106,119 @@ check('the new column is at the END of the header row', () => {
     'appending keeps every existing column at the index older rows were written at');
 });
 
+/* ------------------------------------------------------------------
+ * The header patch. Rows are written POSITIONALLY from LEDGER_HEADERS but
+ * read back by the sheet's own header row, so a sheet that predates a column
+ * would write the new value into an unlabelled column and never read it back.
+ * That is this project's recurring bug — a silent discard that reads as
+ * success — so the patch is tested rather than trusted.
+ * ---------------------------------------------------------------- */
+
+function fakeSpreadsheet(sheets) {
+  function makeSheet(name, header) {
+    var grid = header ? [header.slice()] : [];
+    return {
+      name: name,
+      grid: grid,
+      frozen: 0,
+      getLastColumn: function () { return grid.length ? grid[0].length : 0; },
+      setFrozenRows: function (n) { this.frozen = n; },
+      getRange: function (row, col, nRows, nCols) {
+        return {
+          getValues: function () {
+            var out = [];
+            for (var r = 0; r < nRows; r++) {
+              var line = [];
+              for (var c = 0; c < nCols; c++) {
+                var src = grid[row - 1 + r];
+                line.push(src ? (src[col - 1 + c] === undefined ? '' : src[col - 1 + c]) : '');
+              }
+              out.push(line);
+            }
+            return out;
+          },
+          setValues: function (vals) {
+            for (var r = 0; r < vals.length; r++) {
+              var target = row - 1 + r;
+              if (!grid[target]) { grid[target] = []; }
+              for (var c = 0; c < vals[r].length; c++) {
+                grid[target][col - 1 + c] = vals[r][c];
+              }
+            }
+            return this;
+          },
+          setFontWeight: function () { return this; }
+        };
+      }
+    };
+  }
+  var made = {};
+  Object.keys(sheets).forEach(function (n) { made[n] = makeSheet(n, sheets[n]); });
+  return {
+    sheets: made,
+    getSheetByName: function (n) { return made[n] || null; },
+    insertSheet: function (n) { made[n] = makeSheet(n, null); return made[n]; }
+  };
+}
+
+function withFakeSpreadsheet(ssObj, fn) {
+  S.SpreadsheetApp = { openById: function () { return ssObj; } };
+  try { return fn(); } finally { delete S.SpreadsheetApp; }
+}
+
+suite('Ledger sheet — the header patch');
+
+check('A SHEET THAT PREDATES THE COLUMN GETS IT APPENDED', () => {
+  const old = S.LEDGER_HEADERS.slice(0, S.LEDGER_HEADERS.length - 1);
+  const ssObj = fakeSpreadsheet({ ledger: old });
+  withFakeSpreadsheet(ssObj, () => {
+    S.createSheetAdapter('x').ensureSheet('ledger', S.LEDGER_HEADERS);
+  });
+  eq(ssObj.sheets.ledger.grid[0], S.LEDGER_HEADERS,
+    'the header row now matches what the writer emits');
+});
+
+check('running twice changes nothing — it is idempotent', () => {
+  const ssObj = fakeSpreadsheet({ ledger: S.LEDGER_HEADERS.slice() });
+  withFakeSpreadsheet(ssObj, () => {
+    const a = S.createSheetAdapter('x');
+    a.ensureSheet('ledger', S.LEDGER_HEADERS);
+    a.ensureSheet('ledger', S.LEDGER_HEADERS);
+  });
+  eq(ssObj.sheets.ledger.grid[0], S.LEDGER_HEADERS);
+  eq(ssObj.sheets.ledger.grid.length, 1, 'no stray rows');
+});
+
+check('an EMPTY header row is filled from column 1, not column 2', () => {
+  // The off-by-one that would put every value in the wrong column.
+  const ssObj = fakeSpreadsheet({ ledger: [''] });
+  withFakeSpreadsheet(ssObj, () => {
+    S.createSheetAdapter('x').ensureSheet('ledger', S.LEDGER_HEADERS);
+  });
+  eq(ssObj.sheets.ledger.grid[0][0], 'kind', 'first header lands in column A');
+  eq(ssObj.sheets.ledger.grid[0], S.LEDGER_HEADERS);
+});
+
+check('A REORDERED SHEET THROWS RATHER THAN WRITING MISALIGNED ROWS', () => {
+  const swapped = S.LEDGER_HEADERS.slice();
+  swapped[0] = S.LEDGER_HEADERS[1];
+  swapped[1] = S.LEDGER_HEADERS[0];
+  const ssObj = fakeSpreadsheet({ ledger: swapped });
+  let threw = '';
+  withFakeSpreadsheet(ssObj, () => {
+    try { S.createSheetAdapter('x').ensureSheet('ledger', S.LEDGER_HEADERS); }
+    catch (e) { threw = e.message; }
+  });
+  truthy(/column 1/.test(threw) && /Refusing/.test(threw),
+    'a loud failure beats silently unreadable data — got: ' + threw);
+});
+
+check('a missing sheet is still created with the full header row', () => {
+  const ssObj = fakeSpreadsheet({});
+  withFakeSpreadsheet(ssObj, () => {
+    S.createSheetAdapter('x').ensureSheet('ledger', S.LEDGER_HEADERS);
+  });
+  eq(ssObj.sheets.ledger.grid[0], S.LEDGER_HEADERS);
+});
+
 report();

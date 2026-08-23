@@ -1272,11 +1272,33 @@ function createSheetAdapter(spreadsheetId) {
     if (headers && headers.length) {
       var width = Math.max(sh.getLastColumn(), 1);
       var existing = sh.getRange(1, 1, 1, width).getValues()[0]
-        .map(function (h) { return String(h || ''); });
-      var missing = headers.filter(function (h) { return existing.indexOf(h) === -1; });
+        .map(function (h) { return String(h || '').trim(); });
+      // Trailing blanks are not columns. Without this, a sheet whose header
+      // row is empty would get its headers written starting at column 2 while
+      // the writer still fills column 1 — every value off by one.
+      while (existing.length && existing[existing.length - 1] === '') {
+        existing.pop();
+      }
+
+      // Rows are written POSITIONALLY from `headers` but read back by the
+      // sheet's own header row, so the two only agree while the sheet's
+      // headers are this list's prefix, in order. Appending is safe; anything
+      // else is a misalignment that would write real data into the wrong
+      // column and read it back under the wrong name. Fail loudly instead.
+      for (var i = 0; i < existing.length; i++) {
+        if (existing[i] !== headers[i]) {
+          throw new Error('sheet "' + name + '" column ' + (i + 1) +
+            ' is "' + existing[i] + '" but the code expects "' +
+            (headers[i] === undefined ? '(nothing)' : headers[i]) +
+            '". Refusing to write misaligned rows.');
+        }
+      }
+
+      var missing = headers.slice(existing.length);
       if (missing.length) {
         sh.getRange(1, existing.length + 1, 1, missing.length)
           .setValues([missing]).setFontWeight('bold');
+        if (!existing.length) { sh.setFrozenRows(1); }
       }
     }
     return sh;
