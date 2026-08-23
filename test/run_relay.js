@@ -648,4 +648,147 @@ check('THE INTERNAL ROUTE IS UNAFFECTED — it is meant to go to us', () => {
   eq(v.relay, true, 'internal mail addressed only to G247 is the whole point of that route');
 });
 
+// ============================================ THE ROUTING LINE
+suite('parseRecipientsLine — monday tells us who the client is');
+
+const MONDAY_HTML = (line) =>
+  '<div dir="ltr"><p>Please review and approve.</p>' +
+  '<div style="color:#888;font-size:11px">' + line + '</div></div>';
+
+check('THE CLIENT IS READ OUT OF THE BODY', () => {
+  eq(S.parseRecipientsLine(
+    MONDAY_HTML('X-G247-Recipients: n.adroja@inovapharma.com, msalvana@group247ww.com'), ''),
+    ['n.adroja@inovapharma.com', 'msalvana@group247ww.com']);
+});
+
+check('HTML entities and non-breaking spaces do not break it', () => {
+  eq(S.parseRecipientsLine(
+    'X-G247-Recipients:&nbsp;a@inovapharma.com,&nbsp;b@inovapharma.com', ''),
+    ['a@inovapharma.com', 'b@inovapharma.com']);
+});
+
+check('A TAG BOUNDARY MUST NOT GLUE TWO ADDRESSES TOGETHER', () => {
+  // <b>a@x.com</b><b>b@y.com</b> flattened without a separator would read as
+  // one nonsense address. Tags become spaces for exactly this reason.
+  eq(S.parseRecipientsLine(
+    'X-G247-Recipients: <b>a@inovapharma.com</b><b>b@inovapharma.com</b>', ''),
+    ['a@inovapharma.com', 'b@inovapharma.com']);
+});
+
+check('it falls back to the plain-text part', () => {
+  eq(S.parseRecipientsLine('', 'X-G247-Recipients: c@inovapharma.com'),
+    ['c@inovapharma.com']);
+});
+
+check('AN ABSENT OR EMPTY LINE YIELDS NOTHING, NOT A GUESS', () => {
+  eq(S.parseRecipientsLine(MONDAY_HTML('Please approve'), ''), []);
+  eq(S.parseRecipientsLine('X-G247-Recipients:', ''), []);
+  eq(S.parseRecipientsLine('X-G247-Recipients: {{item.text_mm3wq0mc}}', ''), [],
+    'an unresolved monday placeholder is not an address');
+  eq(S.parseRecipientsLine('', ''), []);
+});
+
+check('body prose after the line is not swept up as a recipient', () => {
+  eq(S.parseRecipientsLine(
+    'X-G247-Recipients: a@inovapharma.com\nRegards, someone@elsewhere.com', ''),
+    ['a@inovapharma.com']);
+});
+
+check('duplicates collapse and case is normalised', () => {
+  eq(S.parseRecipientsLine('X-G247-Recipients: A@Inova.com, a@inova.com', ''),
+    ['a@inova.com']);
+});
+
+suite('stripRecipientsLine — the client must never see the plumbing');
+
+check('THE LINE IS GONE FROM THE RELAYED BODY', () => {
+  const out = S.stripRecipientsLine(
+    MONDAY_HTML('X-G247-Recipients: n.adroja@inovapharma.com'));
+  truthy(out.indexOf('X-G247-Recipients') === -1, 'tag leaked: ' + out);
+  truthy(out.indexOf('n.adroja@inovapharma.com') === -1,
+    'the distribution list leaked into the client copy: ' + out);
+});
+
+check('the real message survives intact', () => {
+  const out = S.stripRecipientsLine(
+    MONDAY_HTML('X-G247-Recipients: a@inovapharma.com'));
+  truthy(out.indexOf('Please review and approve.') !== -1, out);
+});
+
+check('a bare inline line is stripped too', () => {
+  const out = S.stripRecipientsLine('Approve please. X-G247-Recipients: a@b.com');
+  eq(out.indexOf('X-G247-Recipients'), -1);
+  truthy(out.indexOf('Approve please.') !== -1);
+});
+
+check('a body without the line is returned unchanged', () => {
+  const body = MONDAY_HTML('Please approve');
+  eq(S.stripRecipientsLine(body), body);
+  eq(S.stripRecipientsLine(''), '');
+});
+
+suite('The routing line drives the send');
+
+check('THE BODY LINE OUTRANKS THE LEDGER', () => {
+  const v = S.shouldRelay(
+    CLIENT_MSG({ recipientsLine: ['n.adroja@inovapharma.com'] }),
+    clientCtx({ participantsFor: () => ['stale@inovapharma.com'] }));
+  eq(v.relay, true);
+  eq(v.recipientSource, 'body-line');
+  eq(v.outsiders, ['n.adroja@inovapharma.com'],
+    'monday reads it off the item at send time, so it cannot be stale');
+});
+
+check('with no line it falls back to the ledger', () => {
+  const v = S.shouldRelay(CLIENT_MSG(), clientCtx({
+    participantsFor: () => ['n.adroja@inovapharma.com']
+  }));
+  eq(v.relay, true);
+  eq(v.recipientSource, 'ledger-participants');
+});
+
+check('A LINE WITH NO CLIENT ON IT IS ITS OWN SKIP REASON', () => {
+  // Distinct from no-client-on-thread so the log says which mechanism failed:
+  // an empty Group Email column, not an internal-only Gmail thread.
+  const v = S.shouldRelay(
+    CLIENT_MSG({ recipientsLine: ['msalvana@group247ww.com'] }),
+    clientCtx({ participantsFor: () => ['n.adroja@inovapharma.com'] }));
+  eq(v.relay, false);
+  eq(v.reason, 'routing-line-has-no-client');
+});
+
+check('THE RELAYED COPY GOES OUT WITHOUT THE LINE', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  messages: { GM1: CLIENT_MSG({
+                    recipientsLine: ['n.adroja@inovapharma.com'],
+                    bodyHtml: MONDAY_HTML('X-G247-Recipients: n.adroja@inovapharma.com')
+                  }) } });
+  const before = S.ROUTE;
+  S.ROUTE = 'client';
+  let raw = '';
+  r.deps.gmail.sendRaw = (x) => { raw = x; return 'SENT1'; };
+  S.runRelayPass(r.deps, {});
+  S.ROUTE = before;
+  truthy(raw.indexOf('X-G247-Recipients') === -1,
+    'the routing line reached the client — this is visible in their inbox');
+  truthy(/^To: n\.adroja@inovapharma\.com, msalvana@group247ww\.com$/m.test(raw),
+    raw.split('\r\n')[0]);
+});
+
+check('the banner names the client, never the marker', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  messages: { GM1: CLIENT_MSG({
+                    recipientsLine: ['n.adroja@inovapharma.com'] }) } });
+  const before = S.ROUTE;
+  S.ROUTE = 'client';
+  let raw = '';
+  r.deps.gmail.sendRaw = (x) => { raw = x; return 'SENT1'; };
+  S.runRelayPass(r.deps, {});
+  S.ROUTE = before;
+  truthy(raw.indexOf('monday-client-relay@group247ww.com') === -1,
+    'the marker address is internal plumbing and leaked into the body');
+});
+
 report();

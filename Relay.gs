@@ -115,6 +115,26 @@ var INTERNAL_DOMAINS = ['group247ww.com'];
 var CLIENT_ROUTE_MARKER = 'monday-client-relay@group247ww.com';
 
 /**
+ * THE ROUTING LINE. monday tells us who the client is, in its own message body.
+ *
+ * The relay cannot learn the client any other way. Once the automation stops
+ * addressing them, their address is nowhere in the headers; the intake cannot
+ * read it at item-creation time because monday's project-setup chain populates
+ * those columns AFTER the item exists (which is why two of six items on 22
+ * August had no p_email at all); and the Gmail thread does not carry them — the
+ * 23 August audit found zero real client contacts across 18 projects.
+ *
+ * So the automation body carries a line the relay parses:
+ *
+ *     X-G247-Recipients: {{item.text_mm3wq0mc}}
+ *
+ * It is read from the item at the moment monday sends, so it cannot go stale,
+ * and it needs no monday credential in this script. It MUST be stripped before
+ * the relayed copy goes out — see stripRecipientsLine().
+ */
+var RECIPIENTS_LINE_TAG = 'X-G247-Recipients';
+
+/**
  * Never a recipient of a relayed copy, whatever the ledger says.
  * Automated senders end up on threads and must not be mailed back.
  */
@@ -266,6 +286,75 @@ function clientRecipients(participants, pmMailbox) {
   return out;
 }
 
+/**
+ * Pull the routing line out of a monday body.
+ *
+ * monday sends HTML, so the line arrives wrapped in markup and entities and
+ * possibly split across tags: <div>X-G247-Recipients: a@b.com,&nbsp;c@d.com</div>
+ * Tags are flattened to spaces first so a tag boundary cannot glue two
+ * addresses together or hide the tag itself.
+ *
+ * Returns [] when the line is absent or empty — the caller must treat that as a
+ * refusal to send, never as "no extra recipients".
+ * PURE.
+ */
+function parseRecipientsLine(html, text) {
+  var sources = [String(html || ''), String(text || '')];
+  for (var i = 0; i < sources.length; i++) {
+    var flat = sources[i]
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      // Collapse SPACES AND TABS ONLY. Newlines are load-bearing: they
+      // terminate the line in the plain-text part, and collapsing them let the
+      // match run on into the body and swallow the next address it found.
+      .replace(/[^\S\r\n]+/g, ' ');
+    var re = new RegExp(RECIPIENTS_LINE_TAG + '\\s*:([^<\\n\\r]*)', 'i');
+    var m = re.exec(flat);
+    if (!m) { continue; }
+
+    // Only up to the end of the line's addresses. Anything after the last
+    // address on that line is body text, not a recipient.
+    var out = [];
+    var seen = {};
+    var ar = /[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}/gi;
+    var a;
+    while ((a = ar.exec(m[1])) !== null) {
+      var v = a[0].toLowerCase();
+      if (seen[v]) { continue; }
+      seen[v] = true;
+      out.push(v);
+    }
+    if (out.length) { return out; }
+  }
+  return [];
+}
+
+/**
+ * Remove the routing line from a body before it is sent on.
+ *
+ * THE CLIENT MUST NEVER SEE THIS. It is internal plumbing, it names everyone
+ * else on the distribution, and a leak is visible in their inbox and cannot be
+ * recalled. Removal happens on both the HTML and plain-text parts because
+ * either may be what their client renders.
+ * PURE.
+ */
+function stripRecipientsLine(body) {
+  var s = String(body || '');
+  if (!s) { return s; }
+
+  // The whole element that contains the tag, when it sits in its own block.
+  s = s.replace(new RegExp('<(p|div|span|td|tr|li)[^>]*>\\s*(?:<[^>]*>\\s*)*' +
+    RECIPIENTS_LINE_TAG + '[\\s\\S]*?</\\1>', 'gi'), '');
+
+  // Otherwise the run of text from the tag to the end of its line or element.
+  s = s.replace(new RegExp(RECIPIENTS_LINE_TAG + '\\s*:[^<\\n\\r]*', 'gi'), '');
+
+  return s;
+}
+
 // ================================================================ FORMATTING
 
 function escapeHtml(s) {
@@ -409,8 +498,20 @@ function shouldRelay(m, ctx) {
              recipients: [anchor.mailbox] };
   }
 
-  var people = clientRecipients(
-    ctx.participantsFor ? ctx.participantsFor(anchor.threadId) : [], anchor.mailbox);
+  // WHERE THE CLIENT COMES FROM.
+  //
+  // The routing line is the source of truth: monday reads it off the item at
+  // send time, so it is current by construction. The ledger's participants are
+  // a fallback for the case the line is absent — but the 23 August audit says
+  // that fallback reaches no real client on any project, so it is a safety net
+  // that is expected to catch nothing, not a second mechanism.
+  var fromLine = m.recipientsLine || [];
+  var source = fromLine.length ? 'body-line' : 'ledger-participants';
+  var raw = fromLine.length
+    ? fromLine
+    : (ctx.participantsFor ? ctx.participantsFor(anchor.threadId) : []);
+
+  var people = clientRecipients(raw, anchor.mailbox);
   if (!people.length) {
     return { relay: false, reason: 'no-recipients-in-ledger', itemId: ids[0] };
   }
@@ -429,11 +530,12 @@ function shouldRelay(m, ctx) {
   // addressed". If not, the relay must not pretend it delivered.
   var outsiders = people.filter(function (a) { return !isInternalAddress(a); });
   if (!outsiders.length) {
-    return { relay: false, reason: 'no-client-on-thread', itemId: ids[0] };
+    return { relay: false, itemId: ids[0],
+      reason: fromLine.length ? 'routing-line-has-no-client' : 'no-client-on-thread' };
   }
 
   return { relay: true, reason: 'ok', itemId: ids[0], anchor: anchor,
-           recipients: people, outsiders: outsiders };
+           recipients: people, outsiders: outsiders, recipientSource: source };
 }
 
 // ==================================================================== HEALTH
@@ -622,11 +724,16 @@ function runRelayPass(deps, opts) {
       route: ROUTE,
       sourceMessageId: m.id,
       originalSubject: m.subject,
-      sentTo: (m.addresses || []).filter(function (a) {
-        return !/pulse-\d+@/i.test(a);
-      }).join(', '),
-      html: m.bodyHtml,
-      text: m.bodyText
+      sentTo: (ROUTE === 'client' ? (verdict.outsiders || []) :
+        (m.addresses || []).filter(function (a) {
+          return !/pulse-\d+@/i.test(a) &&
+                 String(a).toLowerCase() !== CLIENT_ROUTE_MARKER.toLowerCase();
+        })).join(', '),
+      // STRIPPED. The routing line is plumbing and names the whole
+      // distribution; the client must never see it, and a sent mail cannot be
+      // recalled.
+      html: stripRecipientsLine(m.bodyHtml),
+      text: stripRecipientsLine(m.bodyText)
     }, deps.b64);
 
     if (opts.dryRun) {
@@ -655,7 +762,8 @@ function runRelayPass(deps, opts) {
         ts: deps.now(), route: ROUTE, sourceMessageId: m.id, itemId: verdict.itemId,
         toMailbox: toLine, threadId: verdict.anchor.threadId,
         subject: m.subject, relayedMessageId: sent,
-        result: selfMode ? 'sent-self' : 'sent', detail: ''
+        result: selfMode ? 'sent-self' : 'sent',
+        detail: verdict.recipientSource || ''
       });
     } catch (e) {
       summary.failed++;
@@ -793,7 +901,8 @@ function gmailService_() {
         subject: (header(p, 'Subject')[0] || ''),
         syncHeader: (header(p, SYNC_HEADER_NAME)[0] || ''),
         bodyHtml: html,
-        bodyText: text
+        bodyText: text,
+        recipientsLine: parseRecipientsLine(html, text)
       };
     },
 
