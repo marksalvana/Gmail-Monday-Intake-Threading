@@ -516,23 +516,18 @@ function shouldRelay(m, ctx) {
     return { relay: false, reason: 'no-recipients-in-ledger', itemId: ids[0] };
   }
 
-  // AN ALL-INTERNAL RECIPIENT LIST IS A FAILURE, NOT A SMALL AUDIENCE.
+  // NO CLIENT IS A LEGITIMATE STATE, NOT A FAILURE. (Changed 24 Aug.)
   //
-  // clientRecipients() always appends the PM, so the list is never empty — which
-  // means an empty-list check protects nothing. On a thread with no client on
-  // it, this route would send the approval request to G247 staff, record 'sent',
-  // and the client would never learn they were asked. The 23 August audit says
-  // that is the majority case: of 18 projects, 8 were internal-only and of the
-  // 10 with an outside address, every one was a vendor or a test account — not
-  // a single real client.
+  // This guard used to refuse to send when nobody outside G247 was addressed,
+  // on the reasoning that an all-internal send means the client was meant to
+  // receive something and did not. The routing line removes that ambiguity: it
+  // is read off C. Email at send time, so an empty result means this project
+  // genuinely has no client contact — typically one created by hand rather than
+  // through the bridge. Those still need to reach the item and the PM.
   //
-  // So the question is not "is anyone addressed" but "is anyone OUTSIDE
-  // addressed". If not, the relay must not pretend it delivered.
+  // So the relay always sends, and records how many outside recipients there
+  // were. A run with clients=0 is auditable without being blocked.
   var outsiders = people.filter(function (a) { return !isInternalAddress(a); });
-  if (!outsiders.length) {
-    return { relay: false, itemId: ids[0],
-      reason: fromLine.length ? 'routing-line-has-no-client' : 'no-client-on-thread' };
-  }
 
   return { relay: true, reason: 'ok', itemId: ids[0], anchor: anchor,
            recipients: people, outsiders: outsiders, recipientSource: source };
@@ -630,7 +625,7 @@ function healthMessage(h) {
 function runRelayPass(deps, opts) {
   opts = opts || {};
   var summary = { route: ROUTE, mode: '', scanned: 0, relayed: 0, skipped: 0,
-                  failed: 0, seeded: false, reasons: {} };
+                  failed: 0, seeded: false, noClient: 0, reasons: {} };
 
   // off  = nothing sent.
   // self = built and sent, but addressed to ALERT_EMAIL only, so the client
@@ -711,6 +706,13 @@ function runRelayPass(deps, opts) {
       break;   // cursor is not advanced past it — retried next window
     }
 
+    if (!(verdict.outsiders || []).length) {
+      summary.noClient++;
+      deps.log('info', 'item ' + verdict.itemId + ' has no client contact — ' +
+        'relaying to the PM and the item only. Expected on projects created by ' +
+        'hand rather than through the bridge.');
+    }
+
     var recipients = (verdict.recipients || []).slice();
     var selfMode = (mode === 'self');
     var toLine = selfMode ? ALERT_EMAIL : recipients.join(', ');
@@ -763,7 +765,8 @@ function runRelayPass(deps, opts) {
         toMailbox: toLine, threadId: verdict.anchor.threadId,
         subject: m.subject, relayedMessageId: sent,
         result: selfMode ? 'sent-self' : 'sent',
-        detail: verdict.recipientSource || ''
+        detail: (verdict.recipientSource || '') +
+          '; clients=' + ((verdict.outsiders || []).length)
       });
     } catch (e) {
       summary.failed++;

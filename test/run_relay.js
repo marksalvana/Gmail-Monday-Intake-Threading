@@ -613,16 +613,18 @@ check('the alert text names the dead-relay case first', () => {
 
 suite('The all-internal guard — the failure the audit found');
 
-check('A THREAD WITH NO CLIENT ON IT IS NOT RELAYED', () => {
-  // clientRecipients() always appends the PM, so the list is never empty and an
-  // empty-list check protects nothing. Without this guard the approval request
-  // goes to G247 staff, records 'sent', and the client never learns they were
-  // asked. 8 of 18 audited projects are exactly this shape.
+check('A PROJECT WITH NO CLIENT STILL REACHES THE PM AND THE ITEM', () => {
+  // Changed 24 Aug. The routing line is read off C. Email at send time, so an
+  // empty result is not ambiguity — it means this project has no client
+  // contact, typically one created by hand rather than through the bridge.
+  // Those updates must still flow to the item and the PM.
   const v = S.shouldRelay(CLIENT_MSG(), clientCtx({
     participantsFor: () => ['msalvana@group247ww.com', 'dnoble@group247ww.com']
   }));
-  eq(v.relay, false);
-  eq(v.reason, 'no-client-on-thread');
+  eq(v.relay, true);
+  eq(v.outsiders, [], 'nobody outside G247 — recorded, not refused');
+  truthy(v.recipients.indexOf('msalvana@group247ww.com') !== -1,
+    'the PM is still addressed: ' + v.recipients.join(', '));
 });
 
 check('one outsider is enough', () => {
@@ -633,14 +635,16 @@ check('one outsider is enough', () => {
   eq(v.outsiders, ['j.lee@inovapharma.com'], 'and the outsiders are named for the log');
 });
 
-check('a blocklisted outsider does NOT count as a client', () => {
+check('a blocklisted outsider is still not counted as a client', () => {
   // mailer-daemon@googlemail.com and notifications@monday.com are both live in
-  // the ledger. Neither makes a thread client-reachable.
+  // the ledger. Neither is a client, and neither is ever mailed — but the send
+  // still goes ahead to the PM.
   const v = S.shouldRelay(CLIENT_MSG(), clientCtx({
     participantsFor: () => ['msalvana@group247ww.com', 'mailer-daemon@googlemail.com']
   }));
-  eq(v.relay, false);
-  eq(v.reason, 'no-client-on-thread');
+  eq(v.relay, true);
+  eq(v.outsiders, [], 'a daemon does not make this a client-reachable project');
+  eq(v.recipients, ['msalvana@group247ww.com'], 'and it is never a recipient');
 });
 
 check('THE INTERNAL ROUTE IS UNAFFECTED — it is meant to go to us', () => {
@@ -747,14 +751,16 @@ check('with no line it falls back to the ledger', () => {
   eq(v.recipientSource, 'ledger-participants');
 });
 
-check('A LINE WITH NO CLIENT ON IT IS ITS OWN SKIP REASON', () => {
-  // Distinct from no-client-on-thread so the log says which mechanism failed:
-  // an empty Group Email column, not an internal-only Gmail thread.
+check('AN EMPTY C. EMAIL SENDS TO THE PM, IT DOES NOT SKIP', () => {
+  // The routing line is authoritative. If it names nobody outside G247, the
+  // project has no client — send to the PM and record clients=0.
   const v = S.shouldRelay(
     CLIENT_MSG({ recipientsLine: ['msalvana@group247ww.com'] }),
     clientCtx({ participantsFor: () => ['n.adroja@inovapharma.com'] }));
-  eq(v.relay, false);
-  eq(v.reason, 'routing-line-has-no-client');
+  eq(v.relay, true);
+  eq(v.recipientSource, 'body-line',
+    'and the line still outranks the ledger — a stale participant is NOT promoted to client');
+  eq(v.outsiders, []);
 });
 
 check('THE RELAYED COPY GOES OUT WITHOUT THE LINE', () => {
@@ -789,6 +795,19 @@ check('the banner names the client, never the marker', () => {
   S.ROUTE = before;
   truthy(raw.indexOf('monday-client-relay@group247ww.com') === -1,
     'the marker address is internal plumbing and leaked into the body');
+});
+
+check('the pass counts client-less sends separately', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  messages: { GM1: CLIENT_MSG({
+                    recipientsLine: ['msalvana@group247ww.com'] }) } });
+  const before = S.ROUTE;
+  S.ROUTE = 'client';
+  const s = S.runRelayPass(r.deps, {});
+  S.ROUTE = before;
+  eq(s.relayed, 1);
+  eq(s.noClient, 1, 'auditable without being blocked');
 });
 
 report();
