@@ -1,0 +1,7 @@
+{
+  "name": "g247-monday-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Relays monday automation emails from projects@group247ww.com into the project's Gmail thread. Two deployments, one file, differing only in ROUTE.",
+  "scripts": { "test": "node test/run_relay.js" }
+}
