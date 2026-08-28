@@ -68,9 +68,18 @@ var LEDGER_SHEET = 'ledger';
  * script project, so separate projects do not serialise against each other:
  * three projects appending to one sheet would eventually overwrite each other's
  * rows. Separate spreadsheets remove the problem rather than manage it.
- * Create one per deployment and paste its id here.
+ *
+ * One per route, both listed here and chosen by ROUTE, so a fresh paste of this
+ * file is immediately correct and there is no manual step to forget. Getting
+ * these two crossed would make each deployment read the other's dedup rows and
+ * relay everything twice, so the two ids never live in the same variable.
  */
-var STATE_SPREADSHEET_ID = '';
+var STATE_SPREADSHEET_IDS = {
+  internal: '10KSgw9vgpzBsg69XZpdzhINDsM0TUvPVWYOyq2gWIJw',   // Relay-INTERNAL
+  client:   '1zCN0symOM6DrZTNl0VxZYkI9wvMSCg1rAFCjeBlWhdY'    // Relay-CLIENT
+};
+
+var STATE_SPREADSHEET_ID = STATE_SPREADSHEET_IDS[ROUTE] || '';
 
 var STATE_SHEET = 'relayed';
 var STATE_HEADERS = ['ts', 'route', 'sourceMessageId', 'itemId', 'toMailbox',
@@ -138,10 +147,68 @@ var RECIPIENTS_LINE_TAG = 'X-G247-Recipients';
  * Never a recipient of a relayed copy, whatever the ledger says.
  * Automated senders end up on threads and must not be mailed back.
  */
+/**
+ * OPT-IN HTML.
+ *
+ * monday's send-email action ships text/plain no matter what its "Message"
+ * format dropdown says — verified 27 Aug on three consecutive sends with the
+ * dropdown set to HTML: every one arrived with a text/plain part and no
+ * text/html part, tags intact as literal characters. So a PM who types <b>Hi</b>
+ * into the automation body gets <b>Hi</b> in front of the client.
+ *
+ * The relay cannot detect intent by sniffing for tags — a client quoting
+ * "use <brackets>" would be silently reformatted — so the automation body opts
+ * in explicitly, exactly like the routing line:
+ *
+ *     X-G247-HTML: 1
+ *
+ * With it, the body is rendered as authored HTML through a DEFAULT-DENY
+ * whitelist (see renderAuthoredHtml). Without it, nothing changes: the body is
+ * escaped into a <pre> as it has been all along. Absent or malformed means
+ * plain — the safe direction, because escaping HTML that was meant as HTML
+ * looks wrong, while NOT escaping text that was never HTML can execute.
+ *
+ * MUST be stripped before relaying — it is plumbing, like the routing line.
+ */
+var HTML_LINE_TAG = 'X-G247-HTML';
+
+/**
+ * The ONLY tags that survive. Everything else is escaped and shown literally,
+ * so a PM's unclosed <div or stray <script never reaches a client's mail
+ * client as markup. Anchors are handled separately because they carry an
+ * attribute; every other tag here is attribute-free by construction.
+ */
+var HTML_ALLOWED_TAGS = ['b', 'strong', 'i', 'em', 'u', 'br', 'p',
+  'ul', 'ol', 'li', 'blockquote'];
+
 var RECIPIENT_BLOCKLIST = ['noreply', 'no-reply', 'donotreply', 'do-not-reply',
   'mailer-daemon', 'postmaster', 'bounce', 'notifications'];
 
 /** Where self-mode copies and every health alert go. */
+/**
+ * HOW LONG TO WAIT FOR THE INTAKE TO ROOT A monday-CREATED PROJECT.
+ *
+ * A project created by hand on the board has no Gmail thread, so shouldRelay()
+ * returns 'item-has-no-gmail-thread' and the email is dropped. The intake now
+ * seeds an anchor for exactly this case when it sees the same monday automation
+ * email in the PM's mailbox (its bypass rung), but the two scripts run on
+ * independent 5-minute triggers and the relay may get there first.
+ *
+ * WHY THE RELAY DOES NOT SEED THIS ITSELF. It could: the send path needs only
+ * headerMessageId, subject and mailbox, all of which it can read off the source
+ * message. But the internal and client copies are separate script projects with
+ * separate state, and they process different automation emails — so each would
+ * seed from a different Message-ID and the two routes would end up threading a
+ * monday-created project into two different conversations. The ledger is the
+ * only place both can agree, and only the intake, which runs as the PM, can see
+ * the PM-mailbox threadId a valid ledger anchor needs.
+ *
+ * So the relay waits instead. Within the window the message is left unprocessed
+ * and the cursor is held; past it the message is treated normally (skipped),
+ * because an item nobody ever seeds must not stall the cursor forever.
+ */
+var SEED_GRACE_MS = 30 * 60 * 1000;
+
 var ALERT_EMAIL = 'msalvana@group247ww.com';
 
 /** Header the intake already drops on, so a relayed copy is never re-ingested. */
@@ -341,25 +408,160 @@ function parseRecipientsLine(html, text) {
  * either may be what their client renders.
  * PURE.
  */
-function stripRecipientsLine(body) {
+function stripTaggedLine(body, tag) {
   var s = String(body || '');
-  if (!s) { return s; }
+  if (!s || !tag) { return s; }
 
   // The whole element that contains the tag, when it sits in its own block.
   s = s.replace(new RegExp('<(p|div|span|td|tr|li)[^>]*>\\s*(?:<[^>]*>\\s*)*' +
-    RECIPIENTS_LINE_TAG + '[\\s\\S]*?</\\1>', 'gi'), '');
+    tag + '[\\s\\S]*?</\\1>', 'gi'), '');
 
   // Otherwise the run of text from the tag to the end of its line or element.
-  s = s.replace(new RegExp(RECIPIENTS_LINE_TAG + '\\s*:[^<\\n\\r]*', 'gi'), '');
+  // THE LINE'S OWN NEWLINE GOES WITH IT. Leaving it behind donates a blank line
+  // to the relayed body for every plumbing line stripped — invisible in the
+  // <pre> path, but four trailing <br> in the rendered path.
+  s = s.replace(new RegExp(tag + '\\s*:[^<\\n\\r]*(?:\\r?\\n)?', 'gi'), '');
 
   return s;
 }
 
+/** Both plumbing lines removed. The only stripper the send path should call. */
+function stripRelayPlumbing(body) {
+  return stripTaggedLine(stripTaggedLine(body, RECIPIENTS_LINE_TAG), HTML_LINE_TAG);
+}
+
+function stripRecipientsLine(body) {
+  return stripTaggedLine(body, RECIPIENTS_LINE_TAG);
+}
+
 // ================================================================ FORMATTING
+
+/** Message-IDs compare bare and case-folded: <A@b> and a@b are the same id. PURE. */
+function sameMessageId(a, b) {
+  var norm = function (v) {
+    return String(v === null || v === undefined ? '' : v)
+      .trim().replace(/^<|>$/g, '').toLowerCase();
+  };
+  var x = norm(a);
+  return !!x && x === norm(b);
+}
 
 function escapeHtml(s) {
   return String(s === null || s === undefined ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * Did the automation body ask for HTML?
+ *
+ * Reads the same way as the routing line: flatten any markup, find the tag,
+ * take the rest of that line. Only an explicit affirmative counts. An
+ * unresolved monday token ("[Item's ...]", "{{item.x}}") is NOT affirmative —
+ * that mistake is exactly how the routing line silently fell back for two days.
+ * PURE.
+ */
+function parseHtmlOptIn(html, text) {
+  var sources = [String(html || ''), String(text || '')];
+  for (var i = 0; i < sources.length; i++) {
+    var flat = sources[i]
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/[^\S\r\n]+/g, ' ');
+    var m = new RegExp(HTML_LINE_TAG + '\\s*:([^<\\n\\r]*)', 'i').exec(flat);
+    if (!m) { continue; }
+    var v = String(m[1] || '').trim().toLowerCase();
+    if (v === '1' || v === 'true' || v === 'yes' || v === 'on') { return true; }
+    return false;   // present but not affirmative — do not try the other part
+  }
+  return false;
+}
+
+/**
+ * Render a PLAIN-TEXT body that was authored as HTML.
+ *
+ * DEFAULT DENY. Everything is escaped first, then the whitelist is un-escaped —
+ * never the reverse. Un-escaping a whitelist can only ever let through tags on
+ * the list; stripping a blacklist lets through everything nobody thought of.
+ * This text is written by PMs and read by clients, so it gets the paranoid
+ * direction.
+ *
+ * Newlines become <br> because the author wrote plain text: their paragraph
+ * breaks are line breaks, and HTML would collapse them to nothing. This is why
+ * sniffing for tags would not have been enough on its own — the layout needs
+ * converting too, not just the markup preserving.
+ * PURE.
+ */
+function renderAuthoredHtml(text) {
+  // Trailing whitespace is never meaningful and always shows: the plumbing
+  // lines sit at the foot of the body, so whatever blank lines preceded them
+  // would otherwise close every client email with a run of empty <br>.
+  var esc = escapeHtml(String(text === null || text === undefined ? '' : text)
+    .replace(/\s+$/, ''));
+
+  var allowed = {};
+  HTML_ALLOWED_TAGS.forEach(function (t) { allowed[t] = true; });
+
+  var out = '';
+  var stack = [];        // tags actually opened, innermost last
+  var last = 0;
+  // Every escaped tag-shaped run. Attributes may contain &amp; from escaping,
+  // so the scan stops at the first &gt; rather than the first &.
+  var re = /&lt;(\/?)([a-z][a-z0-9]*)([^\n\r]*?)&gt;/gi;
+  var m;
+
+  while ((m = re.exec(esc)) !== null) {
+    out += esc.slice(last, m.index);
+    last = re.lastIndex;
+
+    var closing = m[1] === '/';
+    var name = m[2].toLowerCase();
+    var attrs = m[3] || '';
+    var literal = m[0];
+
+    if (name !== 'a' && !allowed[name]) { out += literal; continue; }
+
+    if (closing) {
+      // ORPHAN CLOSERS ARE DELETED, NOT SHOWN. A rejected opener — an anchor
+      // whose monday token resolved to href="", a <b> carrying an attribute —
+      // leaves its closer behind, and printing &lt;/a&gt; at a client is the
+      // exact artefact this whole function exists to prevent. A PM writing a
+      // bare "</a>" as literal prose does not happen; unresolved tokens do.
+      var at = stack.lastIndexOf(name);
+      if (at === -1) { continue; }
+      while (stack.length > at) { out += '</' + stack.pop() + '>'; }
+      continue;
+    }
+
+    if (name === 'a') {
+      var href = /href\s*=\s*(?:"([^"]*)"|'([^']*)')/i.exec(attrs);
+      var h = href ? String(href[1] !== undefined ? href[1] : href[2]).trim() : '';
+      // Empty, whitespace-only, relative, or an untrusted scheme: the anchor is
+      // dropped and its label survives as plain text. A dead link is worse than
+      // no link — a client clicks it and nothing happens.
+      if (/^(https?:\/\/|mailto:)\S+$/i.test(h)) {
+        out += '<a href="' + h + '">';
+        stack.push('a');
+      }
+      continue;
+    }
+
+    // Every other whitelisted tag is attribute-free by construction. One that
+    // arrives carrying attributes is not the tag we whitelisted, so it is shown
+    // literally rather than sanitised into something the author did not write.
+    if (/\S/.test(attrs.replace(/\/\s*$/, ''))) { out += literal; continue; }
+
+    if (name === 'br') { out += '<br>'; continue; }
+    out += '<' + name + '>';
+    stack.push(name);
+  }
+  out += esc.slice(last);
+
+  // Anything the author left open, we close. Well-formed markup costs nothing
+  // and unbalanced tags render differently in every mail client.
+  while (stack.length) { out += '</' + stack.pop() + '>'; }
+
+  // The author's line breaks. Done last so it cannot disturb tag matching.
+  return out.replace(/\r\n|\r|\n/g, '<br>');
 }
 
 function replySubject(subject) {
@@ -415,7 +617,12 @@ function relayBody(a) {
     '<br><b>' + escapeHtml(a.originalSubject || '(no subject)') + '</b>' +
     (a.sentTo ? '<br>sent to ' + escapeHtml(a.sentTo) : '') +
     '</div>';
-  return head + (a.html || '<pre style="white-space:pre-wrap">' + escapeHtml(a.text || '') + '</pre>');
+  // A real text/html part always wins — it is already markup and needs no
+  // reconstruction. The opt-in only rescues the text/plain-only case, which is
+  // every message monday actually sends.
+  if (a.html) { return head + a.html; }
+  if (a.htmlOptIn) { return head + renderAuthoredHtml(a.text || ''); }
+  return head + '<pre style="white-space:pre-wrap">' + escapeHtml(a.text || '') + '</pre>';
 }
 
 // =============================================================== RATE LIMIT
@@ -490,6 +697,17 @@ function shouldRelay(m, ctx) {
     // Expected and common: only projects the intake created from a labelled
     // email have a Gmail thread. Everything older has nowhere to go.
     return { relay: false, reason: 'item-has-no-gmail-thread', itemId: ids[0] };
+  }
+
+  // THIS MESSAGE IS THE THREAD ROOT — DO NOT ECHO IT.
+  //
+  // A kick-off email addressed at the item roots the project's thread, and the
+  // intake indexes that same message as the anchor. Without this the relay then
+  // "relays" the root: a second copy, In-Reply-To itself, to people who already
+  // have it. On the client route that is a duplicate email to a client, which
+  // cannot be recalled.
+  if (sameMessageId(m.headerMessageId, anchor.headerMessageId)) {
+    return { relay: false, reason: 'is-the-thread-root', itemId: ids[0] };
   }
 
   // The internal route goes to the PM alone, exactly as it does today.
@@ -676,6 +894,14 @@ function runRelayPass(deps, opts) {
   var ids = (page.messageIds || []);
   summary.scanned = ids.length;
 
+  // THE CURSOR MOVES ONLY IF THE WHOLE PAGE WAS PROCESSED.
+  // It used to advance unconditionally, so the rate-cap break and the MAX_BATCH
+  // truncation both discarded every message they had not reached — while the
+  // rate-cap alert told a human the mail was "waiting". Re-reading a window is
+  // free: anything already sent comes back 'already-relayed' from the state
+  // sheet, which is what makes not advancing safe.
+  var pageDrained = !page.hasMore && ids.length <= MAX_BATCH;
+
   for (var i = 0; i < ids.length && i < MAX_BATCH; i++) {
     var m = deps.gmail.messageMeta(ids[i]);
     if (!m || !m.ok) { note('fetch-failed'); continue; }
@@ -686,6 +912,21 @@ function runRelayPass(deps, opts) {
       anchorFor: function (itemId) { return deps.ledger.itemThread(itemId); },
       participantsFor: function (threadId) { return deps.ledger.threadParticipants(threadId); }
     });
+
+    // AWAITING A SEED. Young enough that the intake has probably not run yet:
+    // leave the message alone and hold the cursor so the next pass sees it
+    // again with an anchor in place. Deliberately a `continue`, not a `break` —
+    // breaking would park every other item behind one unrooted project for the
+    // whole grace window.
+    if (!verdict.relay && verdict.reason === 'item-has-no-gmail-thread' &&
+        m.internalDate && (deps.nowMs() - m.internalDate) < SEED_GRACE_MS) {
+      note('awaiting-intake-seed');
+      pageDrained = false;
+      deps.log('info', 'item ' + verdict.itemId + ' has no anchor yet and this ' +
+        'automation email is ' + Math.round((deps.nowMs() - m.internalDate) / 1000) +
+        's old — holding for the intake to root it.');
+      continue;
+    }
 
     if (!verdict.relay) { note(verdict.reason); continue; }
 
@@ -703,7 +944,8 @@ function runRelayPass(deps, opts) {
         'The client relay hit its ' + cap + '/hour cap and stopped this pass. ' +
         'Approval emails are waiting and will not go out until the window ' +
         'rolls. Check the relay state sheet.'); }
-      break;   // cursor is not advanced past it — retried next window
+      pageDrained = false;   // cursor stays put — genuinely retried next window
+      break;
     }
 
     if (!(verdict.outsiders || []).length) {
@@ -734,8 +976,9 @@ function runRelayPass(deps, opts) {
       // STRIPPED. The routing line is plumbing and names the whole
       // distribution; the client must never see it, and a sent mail cannot be
       // recalled.
-      html: stripRecipientsLine(m.bodyHtml),
-      text: stripRecipientsLine(m.bodyText)
+      html: stripRelayPlumbing(m.bodyHtml),
+      text: stripRelayPlumbing(m.bodyText),
+      htmlOptIn: m.htmlOptIn === true
     }, deps.b64);
 
     if (opts.dryRun) {
@@ -790,7 +1033,14 @@ function runRelayPass(deps, opts) {
     }
   }
 
-  if (page.newHistoryId) { deps.state.setCursor(CURSOR_KEY, page.newHistoryId); }
+  if (page.newHistoryId && pageDrained) {
+    deps.state.setCursor(CURSOR_KEY, page.newHistoryId);
+  } else if (page.newHistoryId) {
+    deps.log('info', 'cursor held at ' + cursor + ' — the pass did not drain its ' +
+      'window (' + ids.length + ' seen, batch ' + MAX_BATCH +
+      (page.hasMore ? ', more pages pending' : '') + '). Next pass resumes here.');
+  }
+  summary.pageDrained = pageDrained;
   return summary;
 }
 
@@ -866,7 +1116,13 @@ function gmailService_() {
           if (!seen[msg.id]) { seen[msg.id] = true; ids.push(msg.id); }
         });
       });
-      return { messageIds: ids, newHistoryId: res && res.historyId ? String(res.historyId) : '' };
+      return {
+        messageIds: ids,
+        newHistoryId: res && res.historyId ? String(res.historyId) : '',
+        // Gmail paginates history. Ignoring this silently truncated any backlog
+        // bigger than one page and then advanced the cursor past the remainder.
+        hasMore: !!(res && res.nextPageToken)
+      };
     },
 
     messageMeta: function (id) {
@@ -903,9 +1159,12 @@ function gmailService_() {
         addresses: addresses,
         subject: (header(p, 'Subject')[0] || ''),
         syncHeader: (header(p, SYNC_HEADER_NAME)[0] || ''),
+        internalDate: Number(msg.internalDate || 0),
+        headerMessageId: String(header(p, 'Message-ID')[0] || '').replace(/^<|>$/g, ''),
         bodyHtml: html,
         bodyText: text,
-        recipientsLine: parseRecipientsLine(html, text)
+        recipientsLine: parseRecipientsLine(html, text),
+        htmlOptIn: parseHtmlOptIn(html, text)
       };
     },
 
@@ -977,7 +1236,9 @@ function relayStore_() {
   var cache = null;
   function sheet() {
     if (!STATE_SPREADSHEET_ID) {
-      throw new Error('STATE_SPREADSHEET_ID is not set — create a spreadsheet for this script and paste its id');
+      throw new Error('no state spreadsheet for route "' + ROUTE + '" — ' +
+        'STATE_SPREADSHEET_IDS has ids for: ' +
+        Object.keys(STATE_SPREADSHEET_IDS).join(', '));
     }
     var ss = SpreadsheetApp.openById(STATE_SPREADSHEET_ID);
     var sh = ss.getSheetByName(STATE_SHEET);
@@ -1196,7 +1457,9 @@ function relayPreflight() {
     return n + ' items are syncable; anything older than the bridge is not';
   });
   ck('state spreadsheet', function () {
-    if (!STATE_SPREADSHEET_ID) { throw new Error('STATE_SPREADSHEET_ID is not set'); }
+    if (!STATE_SPREADSHEET_ID) {
+      throw new Error('no state spreadsheet for route "' + ROUTE + '"');
+    }
     return SpreadsheetApp.openById(STATE_SPREADSHEET_ID).getName();
   });
   ck('relay mode', function () { return props_().getProperty(PROP_RELAY_MODE) || 'off (unset)'; });

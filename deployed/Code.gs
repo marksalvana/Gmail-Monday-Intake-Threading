@@ -252,6 +252,19 @@ function isUserLabel(id) {
 }
 
 /**
+ * The monday item id a message is addressed at, from its own ingest address.
+ * ONE regex, used by classify() and by the caller that has to look the item up
+ * before calling it — two copies would drift and the seeding guard depends on
+ * both agreeing. Returns '' when there is no such address.
+ * PURE.
+ */
+function pulseItemIdFrom(to, cc) {
+  var m = String((to || '') + ' ' + (cc || ''))
+    .match(/pulse-(\d+)@g247ww\.us\.monday\.com/i);
+  return m ? String(m[1]) : '';
+}
+
+/**
  * @param {Object|string} raw   Gmail users.history.list response.
  * @param {string} startHistoryId  Cursor the request was made from.
  * @return {{items: Array<{mid:string,tid:string,hid:string}>, count:number,
@@ -473,8 +486,13 @@ function classifyMessage(input) {
   }
 
   // Mail addressed straight at a monday item's own ingest address.
-  var bypassRe = /pulse-(\d+)@g247ww\.us\.monday\.com/i;
-  var bypassMatch = (to + ' ' + cc).match(bypassRe);
+  var bypassItemId = pulseItemIdFrom(to, cc);
+  var bypassMatch = bypassItemId ? [bypassItemId, bypassItemId] : null;
+
+  // Does the ledger already index that item? Load-bearing for seeding: see the
+  // bypass branch below.
+  var bypassItemKnown = (input.bypassItemKnown === true ||
+                         input.bypassItemKnown === 'true');
 
   var labelIds = labelIdsCsv ? String(labelIdsCsv).split(',') : [];
   var labelNames = labelIds.map(function (id) { return labelMap[id] || id; });
@@ -536,8 +554,28 @@ function classifyMessage(input) {
              '; written by the monday->gmail bridge, not re-ingested (loop guard)';
 
   } else if (bypassMatch) {
-    classification = 'bypass-monday-intake';
-    detail = 'itemId=' + bypassMatch[1];
+    // A monday automation email, addressed at the item and copied to the PM.
+    //
+    // SEEDING. A project created by hand on the board has no Gmail thread, so
+    // the outbound relay has nothing to thread its approval emails onto and
+    // drops them. This message is in the PM's mailbox, which makes it the only
+    // thing in the system that knows a valid threadId for that PM — so it is
+    // rooted here, and every later email for the item threads onto it.
+    //
+    // THE GUARD IS THE WHOLE FEATURE. This rung sits above `alreadyProcessed`
+    // and `threadKnown`, so EVERY automation email for EVERY item lands here
+    // forever. Seeding without checking both would repoint a project's anchor
+    // at a newer message on every status change — a write that reads as success
+    // and silently detaches the thread the client is actually replying on.
+    if (!threadKnown && !bypassItemKnown) {
+      classification = 'seed-monday-created-item';
+      detail = 'itemId=' + bypassMatch[1] +
+               '; item has no gmail thread — rooting it on this message';
+    } else {
+      classification = 'bypass-monday-intake';
+      detail = 'itemId=' + bypassMatch[1] +
+               (threadKnown ? '; thread already anchored' : '; item already indexed');
+    }
 
   } else if (alreadyProcessed) {
     classification = 'skipped-already-processed';
@@ -1722,7 +1760,8 @@ function runIntake(deps, opts) {
         boardNameMap: boardNameMap,
         alreadyProcessed: ledger.hasMessage(headerMessageId),
         threadKnown: !!ledger.threadAnchor(msg.threadId || cand.tid),
-        threadAnchorItemId: ledger.threadAnchor(msg.threadId || cand.tid)
+        threadAnchorItemId: ledger.threadAnchor(msg.threadId || cand.tid),
+        bypassItemKnown: !!ledger.itemThread(pulseItemIdFrom(msg.to, msg.cc))
       });
 
       log.decision({
@@ -1881,6 +1920,41 @@ function applyDecision(deps, ctx, summary) {
       participants: collectParticipants(msg.from, msg.to, msg.cc)
     });
     summary.appended++;
+
+  } else if (d.classification === 'seed-monday-created-item') {
+    // ROOT A PROJECT THAT WAS CREATED ON THE BOARD, NOT BY EMAIL.
+    //
+    // No monday call — the item already exists, that is the whole premise. All
+    // this writes is the two ledger rows the rest of the system reads:
+    //
+    //   thread anchor  makes the client's later reply classify as
+    //                  'append-to-existing-item' instead of falling through to
+    //                  the board checks and creating a SECOND project.
+    //   item index     is what the outbound relay's anchorFor() reads, so its
+    //                  approval emails finally have something to thread onto.
+    //
+    // Both are written from THIS mailbox's view of the thread, which is the
+    // point: the relay runs as projects@ and can never know a threadId that
+    // means anything to the PM.
+    //
+    // No participants row. Participants are collected from real correspondence;
+    // this message is machine mail addressed to the item and the PM, and
+    // seeding it would put the automation's own recipients into the list the
+    // relay falls back on when the routing line is missing.
+    var seedItemId = String((d.detail.match(/itemId=(\d+)/) || [])[1] || '');
+    if (seedItemId) {
+      var seed = {
+        mondayItemId: seedItemId, mailbox: ctx.mailbox,
+        threadId: msg.threadId,
+        headerMessageId: ctx.rawMessageId || ctx.headerMessageId,
+        gmailMessageId: ctx.candidate.mid, boardId: d.targetBoardId,
+        subject: msg.subject, createdAt: ctx.now(), source: 'seed'
+      };
+      deps.ledger.stageMessage(seed);
+      deps.ledger.stageThreadAnchor(seed);
+      deps.ledger.stageItemIndex(seed);
+      summary.seeded = (summary.seeded || 0) + 1;
+    }
 
   } else {
     // Everything else is a decision NOT to act. Record the message so the same

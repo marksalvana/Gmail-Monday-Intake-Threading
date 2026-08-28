@@ -810,4 +810,346 @@ check('the pass counts client-less sends separately', () => {
   eq(s.noClient, 1, 'auditable without being blocked');
 });
 
+
+
+// ============================================== OPT-IN HTML (added 27 Aug)
+suite('parseHtmlOptIn — only an explicit yes counts');
+
+check('an affirmative line opts in, in either body part', () => {
+  truthy(S.parseHtmlOptIn('', 'X-G247-HTML: 1'));
+  truthy(S.parseHtmlOptIn('', 'X-G247-HTML: true'));
+  truthy(S.parseHtmlOptIn('<div>X-G247-HTML: yes</div>', ''));
+});
+
+check('AN UNRESOLVED MONDAY TOKEN IS NOT A YES', () => {
+  eq(S.parseHtmlOptIn('', "X-G247-HTML: [Item's html flag]"), false,
+    'the routing line already fell back silently on an unresolved token once');
+  eq(S.parseHtmlOptIn('', 'X-G247-HTML: {{item.foo}}'), false);
+});
+
+check('absent, empty or negative is plain', () => {
+  eq(S.parseHtmlOptIn('', ''), false);
+  eq(S.parseHtmlOptIn('', 'X-G247-HTML:'), false);
+  eq(S.parseHtmlOptIn('', 'X-G247-HTML: 0'), false);
+  eq(S.parseHtmlOptIn('', 'Hi there, no flag here'), false);
+});
+
+suite('renderAuthoredHtml — default deny');
+
+check('whitelisted tags survive and line breaks become <br>', () => {
+  eq(S.renderAuthoredHtml('Hi <b>Mark</b>,\n\nPlease review.'),
+     'Hi <b>Mark</b>,<br><br>Please review.');
+});
+
+check('an http anchor is linkified, query strings included', () => {
+  eq(S.renderAuthoredHtml('<a href="https://portal.group247ww.com/#tab3">Portal</a>'),
+     '<a href="https://portal.group247ww.com/#tab3">Portal</a>');
+  eq(S.renderAuthoredHtml('<a href="https://x.com/?a=1&b=2">L</a>'),
+     '<a href="https://x.com/?a=1&amp;b=2">L</a>');
+});
+
+check('A JAVASCRIPT HREF IS DROPPED, THE LABEL IS KEPT', () => {
+  eq(S.renderAuthoredHtml('<a href="javascript:alert(1)">Click</a>'),
+     'Click', 'NO ORPHAN CLOSER LEFT VISIBLE IN A CLIENT EMAIL');
+  eq(S.renderAuthoredHtml('<a href="data:text/html,x">Click</a>'), 'Click');
+});
+
+check('A SCRIPT TAG IS SHOWN, NEVER RENDERED', () => {
+  eq(S.renderAuthoredHtml('<script>alert(1)</script>'),
+     '&lt;script&gt;alert(1)&lt;/script&gt;');
+});
+
+check('an attribute on a whitelisted tag does not get through', () => {
+  eq(S.renderAuthoredHtml('<b onclick="steal()">x</b>'),
+     '&lt;b onclick="steal()"&gt;x',
+     'opener shown literally, its orphan closer deleted');
+});
+
+check('nesting and repeats still balance', () => {
+  eq(S.renderAuthoredHtml('<b>a</b> and <b>c</b>'), '<b>a</b> and <b>c</b>');
+  eq(S.renderAuthoredHtml('<ul><li><b>x</b></li></ul>'), '<ul><li><b>x</b></li></ul>');
+  eq(S.renderAuthoredHtml('</b> alone'), ' alone',
+    'a stray closer is deleted — a PM never types one on purpose, but a ' +
+    'rejected opener always leaves one');
+});
+
+check('an unknown or unclosed tag is escaped, not guessed at', () => {
+  eq(S.renderAuthoredHtml('<div class="x">hi'), '&lt;div class="x"&gt;hi');
+  eq(S.renderAuthoredHtml('a < b and c > d'), 'a &lt; b and c &gt; d');
+});
+
+check('an ampersand in ordinary prose is escaped once, not twice', () => {
+  eq(S.renderAuthoredHtml('review & approve/reject'), 'review &amp; approve/reject');
+});
+
+suite('The opt-in end to end');
+
+check('BOTH PLUMBING LINES ARE STRIPPED FROM THE RELAYED BODY', () => {
+  const body = 'Hi <b>Mark</b>,\nX-G247-Recipients: c@inovapharma.com\nX-G247-HTML: 1';
+  const out = S.stripRelayPlumbing(body);
+  eq(/X-G247-/.test(out), false, out);
+  truthy(out.indexOf('Hi <b>Mark</b>,') === 0);
+});
+
+check("the real Project 12 body renders as the PM meant it", () => {
+  const raw = 'Hi <b>Mark</b>,\n\nPlease reply or use the ' +
+    '<a href="https://portal.group247ww.com/#tab3">Client Portal Link</a>\n\n' +
+    'Kind regards,\nMark Salvana\n\nX-G247-HTML: 1';
+  const out = S.relayBody({ itemId: '12908832032', originalSubject: 'Project 12',
+    sentTo: 'c@inovapharma.com', text: S.stripRelayPlumbing(raw),
+    htmlOptIn: S.parseHtmlOptIn('', raw) });
+  truthy(out.indexOf('<b>Mark</b>') > -1, 'bold survived');
+  truthy(out.indexOf('<a href="https://portal.group247ww.com/#tab3">') > -1, 'link survived');
+  eq(/&lt;b&gt;/.test(out), false, 'nothing left escaped');
+  eq(/X-G247-/.test(out), false, 'no plumbing');
+});
+
+check('WITHOUT THE OPT-IN NOTHING CHANGES — the <pre> path is untouched', () => {
+  const out = S.relayBody({ itemId: '1', originalSubject: 's',
+    text: 'Hi <b>Mark</b>,', htmlOptIn: false });
+  truthy(out.indexOf('<pre style="white-space:pre-wrap">') > -1);
+  truthy(out.indexOf('&lt;b&gt;Mark&lt;/b&gt;') > -1, 'still escaped, as today');
+});
+
+check('a real text/html part still wins over the opt-in', () => {
+  const out = S.relayBody({ itemId: '1', originalSubject: 's',
+    html: '<p>real markup</p>', text: 'ignored', htmlOptIn: true });
+  truthy(out.indexOf('<p>real markup</p>') > -1);
+  eq(/ignored/.test(out), false);
+});
+
+
+
+suite('Stripped plumbing leaves no gap');
+
+check('A STRIPPED LINE TAKES ITS NEWLINE WITH IT', () => {
+  eq(S.stripRelayPlumbing('Kind regards,\nMark\n\nX-G247-Recipients: c@x.com\nX-G247-HTML: 1'),
+     'Kind regards,\nMark\n\n');
+  eq(S.stripRelayPlumbing('A\nX-G247-HTML: 1\nB'), 'A\nB',
+     'a mid-body line must not weld its neighbours together');
+});
+
+check('the rendered body does not end in a run of empty breaks', () => {
+  const raw = 'Kind regards,\nMark Salvana\n\nX-G247-Recipients: c@x.com\nX-G247-HTML: 1';
+  const out = S.renderAuthoredHtml(S.stripRelayPlumbing(raw));
+  eq(out, 'Kind regards,<br>Mark Salvana');
+  eq(/(<br>\s*){3,}$/.test(out), false);
+});
+
+check('deliberate blank lines INSIDE the body still survive', () => {
+  eq(S.renderAuthoredHtml('one\n\ntwo'), 'one<br><br>two');
+});
+
+
+
+suite('Anchors with nothing behind them');
+
+check('AN EMPTY HREF DROPS THE ANCHOR, NOT THE LABEL', () => {
+  eq(S.renderAuthoredHtml('<a href="">Approved Files Links</a>'),
+     'Approved Files Links',
+     'an unresolved monday token must never print markup at a client');
+  eq(S.renderAuthoredHtml("<a href=''>Client Approved Link</a>"),
+     'Client Approved Link');
+});
+
+check('a whitespace-only or relative href is dropped the same way', () => {
+  eq(S.renderAuthoredHtml('<a href="   ">L</a>'), 'L');
+  eq(S.renderAuthoredHtml('<a href="/portal">L</a>'), 'L');
+  eq(S.renderAuthoredHtml('<a href="portal.group247ww.com">L</a>'), 'L');
+});
+
+check('a url containing a space is not trusted', () => {
+  eq(S.renderAuthoredHtml('<a href="https://x.com/a b">L</a>'), 'L');
+});
+
+check('the real approval-feedback body degrades cleanly', () => {
+  const raw = 'Approval Feedback:\n\n<a href="">Approved Files Links</a>\n' +
+    '<a href="">Client Approved Link </a>\n\nAction next steps accordingly: ' +
+    '<a href="https://g247ww.monday.com/boards/18401123784">link</a>';
+  const out = S.renderAuthoredHtml(raw);
+  eq(/&lt;a|<a href=""/.test(out), false, out);
+  truthy(out.indexOf('Approved Files Links') > -1, 'label kept');
+  truthy(out.indexOf('<a href="https://g247ww.monday.com/boards/18401123784">') > -1,
+    'the real link still works');
+});
+
+check('a good anchor next to a dead one is unaffected', () => {
+  eq(S.renderAuthoredHtml('<a href="">dead</a> and <a href="https://x.com">live</a>'),
+     'dead and <a href="https://x.com">live</a>');
+});
+
+
+
+// ============================================ CURSOR SAFETY + SEED DEFERRAL
+suite('The cursor only moves over ground the pass actually covered');
+
+check('A CLEAN PASS ADVANCES THE CURSOR', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  messages: { GM1: MSG() } });
+  r.deps.gmail.profile = () => 'projects@group247ww.com';
+  S.runRelayPass(r.deps, {});
+  eq(r.cursors[S.CURSOR_KEY], 'H2');
+});
+
+check('THE RATE CAP NO LONGER DISCARDS WHAT IT DID NOT REACH', () => {
+  const msgs = {};
+  const ids = [];
+  for (let i = 0; i < 3; i++) { ids.push('GM' + i); msgs['GM' + i] = MSG({ id: 'GM' + i }); }
+  const r = rig({
+    cursors: { [S.CURSOR_KEY]: 'H1' },
+    page: { messageIds: ids, newHistoryId: 'H2' },
+    messages: msgs,
+    // window already full, so the very first message trips the cap
+    props: { [S.PROP_RELAY_RATE]: JSON.stringify({ windowStart: 1000000, count: 9999 }) }
+  });
+  r.deps.gmail.profile = () => 'projects@group247ww.com';
+  const s = S.runRelayPass(r.deps, {});
+  truthy(s.rateCapped, 'the cap fired');
+  eq(r.cursors[S.CURSOR_KEY], 'H1',
+    'CURSOR HELD. It used to advance to H2 and lose all three — while the ' +
+    'alert told a human they were waiting to go out.');
+});
+
+check('a page Gmail says has more is not drained', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2', hasMore: true },
+                  messages: { GM1: MSG() } });
+  r.deps.gmail.profile = () => 'projects@group247ww.com';
+  const s = S.runRelayPass(r.deps, {});
+  eq(r.cursors[S.CURSOR_KEY], 'H1');
+  eq(s.pageDrained, false);
+});
+
+check('a batch bigger than MAX_BATCH holds the cursor', () => {
+  const msgs = {}; const ids = [];
+  for (let i = 0; i < S.MAX_BATCH + 1; i++) { ids.push('G' + i); msgs['G' + i] = MSG({ id: 'G' + i }); }
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ids, newHistoryId: 'H2' }, messages: msgs });
+  r.deps.gmail.profile = () => 'projects@group247ww.com';
+  S.runRelayPass(r.deps, {});
+  eq(r.cursors[S.CURSOR_KEY], 'H1');
+});
+
+suite('Waiting for the intake to root a monday-created project');
+
+check('AN UNROOTED ITEM IS HELD, NOT DROPPED', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  anchor: null,
+                  messages: { GM1: MSG({ internalDate: 1000000 - 60000 }) } });
+  r.deps.gmail.profile = () => 'projects@group247ww.com';
+  const s = S.runRelayPass(r.deps, {});
+  eq(r.cursors[S.CURSOR_KEY], 'H1', 'held so the next pass sees it seeded');
+  eq(r.calls.indexOf('sendRaw'), -1, 'nothing was sent');
+  eq(s.relayed, 0);
+});
+
+check('PAST THE GRACE WINDOW IT IS RELEASED — an unseeded item cannot stall the cursor forever', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  anchor: null,
+                  messages: { GM1: MSG({ internalDate: 1000000 - S.SEED_GRACE_MS - 1 }) } });
+  r.deps.gmail.profile = () => 'projects@group247ww.com';
+  S.runRelayPass(r.deps, {});
+  eq(r.cursors[S.CURSOR_KEY], 'H2');
+});
+
+check('a message with no internalDate is not held indefinitely', () => {
+  const r = rig({ cursors: { [S.CURSOR_KEY]: 'H1' },
+                  page: { messageIds: ['GM1'], newHistoryId: 'H2' },
+                  anchor: null, messages: { GM1: MSG() } });
+  r.deps.gmail.profile = () => 'projects@group247ww.com';
+  S.runRelayPass(r.deps, {});
+  eq(r.cursors[S.CURSOR_KEY], 'H2');
+});
+
+check('ONE UNROOTED ITEM DOES NOT PARK THE ITEMS BEHIND IT', () => {
+  let n = 0;
+  const r = rig({
+    cursors: { [S.CURSOR_KEY]: 'H1' },
+    page: { messageIds: ['GM1', 'GM2'], newHistoryId: 'H2' },
+    messages: { GM1: MSG({ id: 'GM1', internalDate: 1000000 - 60000 }),
+                GM2: MSG({ id: 'GM2' }) }
+  });
+  // GM1 has no anchor, GM2 does.
+  r.deps.ledger.itemThread = () => (++n === 1 ? null : ANCHOR);
+  r.deps.gmail.profile = () => 'projects@group247ww.com';
+  S.runRelayPass(r.deps, {});
+  truthy(r.calls.indexOf('sendRaw') > -1, 'the rooted one still went out');
+  eq(r.cursors[S.CURSOR_KEY], 'H1', 'but the cursor waits for the unrooted one');
+});
+
+
+
+suite('The root of a thread is never relayed back onto it');
+
+check('sameMessageId compares bare and case-folded', () => {
+  truthy(S.sameMessageId('<A@b.com>', 'a@b.com'));
+  truthy(S.sameMessageId(' a@b.com ', '<A@B.COM>'));
+  eq(S.sameMessageId('', ''), false, 'two blanks are not a match');
+  eq(S.sameMessageId('a@b.com', 'c@d.com'), false);
+});
+
+check('A KICK-OFF EMAIL IS NOT RELAYED TO PEOPLE WHO ALREADY HAVE IT', () => {
+  const v = S.shouldRelay(
+    MSG({ headerMessageId: '<kick@mail.gmail.com>',
+          addresses: ['pulse-555@g247ww.us.monday.com', 'client@inovapharma.com',
+                      'msalvana@group247ww.com'] }),
+    CTX({ route: 'client',
+          anchorFor: () => ({ mailbox: 'msalvana@group247ww.com', threadId: 'T1',
+                              headerMessageId: 'kick@mail.gmail.com',
+                              subject: 'P261344 - Project 12' }) }));
+  eq(v.relay, false);
+  eq(v.reason, 'is-the-thread-root');
+});
+
+check('a later automation email on the same thread still relays', () => {
+  const v = S.shouldRelay(
+    MSG({ headerMessageId: '<approval@mail.gmail.com>',
+          recipientsLine: ['client@inovapharma.com'],
+          addresses: ['pulse-555@g247ww.us.monday.com', 'monday-client-relay@group247ww.com',
+                      'msalvana@group247ww.com'] }),
+    CTX({ route: 'client',
+          anchorFor: () => ({ mailbox: 'msalvana@group247ww.com', threadId: 'T1',
+                              headerMessageId: 'kick@mail.gmail.com',
+                              subject: 'P261344 - Project 12' }) }));
+  eq(v.relay, true);
+  eq(v.anchor.subject, 'P261344 - Project 12',
+    'the kick-off subject becomes the thread subject for every later email');
+});
+
+check('A MESSAGE WITH NO Message-ID IS NEVER MISTAKEN FOR THE ROOT', () => {
+  const v = S.shouldRelay(
+    MSG({ headerMessageId: '',
+          recipientsLine: ['client@inovapharma.com'],
+          addresses: ['pulse-555@g247ww.us.monday.com', 'monday-client-relay@group247ww.com'] }),
+    CTX({ route: 'client',
+          anchorFor: () => ({ mailbox: 'msalvana@group247ww.com', threadId: 'T1',
+                              headerMessageId: 'kick@mail.gmail.com', subject: 'S' }) }));
+  eq(v.relay, true, 'a blank id must not compare equal to anything');
+});
+
+
+
+suite('State spreadsheets — one per route, never crossed');
+
+check('the internal build points at the internal spreadsheet', () => {
+  eq(S.ROUTE, 'internal');
+  eq(S.STATE_SPREADSHEET_ID, S.STATE_SPREADSHEET_IDS.internal);
+});
+
+check('THE TWO IDS ARE DISTINCT', () => {
+  truthy(S.STATE_SPREADSHEET_IDS.internal, 'internal id present');
+  truthy(S.STATE_SPREADSHEET_IDS.client, 'client id present');
+  eq(S.STATE_SPREADSHEET_IDS.internal === S.STATE_SPREADSHEET_IDS.client, false,
+    'ONE SPREADSHEET FOR BOTH ROUTES would make each deployment read the ' +
+    "other's dedup rows and relay everything a second time");
+});
+
+check('neither is the intake ledger', () => {
+  eq(S.STATE_SPREADSHEET_IDS.internal === S.LEDGER_SPREADSHEET_ID, false);
+  eq(S.STATE_SPREADSHEET_IDS.client === S.LEDGER_SPREADSHEET_ID, false);
+});
+
 report();
