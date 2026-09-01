@@ -86,11 +86,48 @@ var MAILBOX_TO_MONDAY_USER = {
  * the Make scenarios are retired.
  */
 var INTEGRATION_USER_IDS = [
-  78417174,  // Mark Salvana — Apps Script token owner (temporary)
+  73995401,  // Client Service (projects@) — the intended token owner. Listed
+             // BEFORE the token is switched, not after: monday attributes every
+             // write to the token owner, so the moment G247_MONDAY_TOKEN becomes
+             // this user, every update the intake writes is authored by them. If
+             // the id is not here the outbound bridge reads its own writes as
+             // human activity. The outbound marker would probably stop the echo
+             // even so — but "probably" is not a guard on a loop that emails
+             // clients.
+  78417174,  // Mark Salvana — current Apps Script token owner. Keep until the
+             // switch is confirmed live; harmless afterwards.
   37824531   // David Noble  — legacy Make token owner; remove after Make retires
 ];
 
 /** Addresses that are machines talking about the machinery. Never ingest. */
+/**
+ * WHICH BUILD IS ACTUALLY PASTED IN THE EDITOR.
+ *
+ * "Is the latest version saved?" cost a live test cycle to answer by reading
+ * code. preflight() now prints this, so the question is a five-second check.
+ * Bump it with any change worth telling apart.
+ */
+var BUILD = 'intake 2026-09-01c seed-on-kickoff+participants+itemmail-sweep+clientservice-id+token-identity';
+
+/**
+ * The host monday gives each item as its own ingest address.
+ *
+ * WHY A SECOND CANDIDATE SOURCE EXISTS AT ALL.
+ * extractCandidates() admits a message only if it carries a user label or is a
+ * reply (threadId !== id) — non-replies without a label are ignored on purpose,
+ * to keep newsletters out of the pipeline. A kick-off email is exactly that:
+ * unlabelled, and the first message of its own thread. It was therefore never a
+ * candidate, never classified, and the seeding rung never ran. The feature was
+ * correct and simply never reached.
+ *
+ * Widening the label rule would drag every newsletter into the fetch loop. So
+ * instead one narrow query per pass asks Gmail for mail addressed at a monday
+ * item, which is precise, cheap, and cannot match anything else.
+ */
+var MONDAY_ITEM_HOST = 'g247ww.us.monday.com';
+var ITEM_MAIL_QUERY = 'to:' + MONDAY_ITEM_HOST + ' newer_than:2d -in:chats';
+var ITEM_MAIL_MAX = 25;
+
 var AUTOMATION_SENDERS = [
   'noreply@us1.make.com',
   'make-events@make.com',
@@ -252,6 +289,37 @@ function isUserLabel(id) {
 }
 
 /**
+ * Did a PM deliberately mark this email as the root of a project's thread?
+ *
+ * ROOTING IS AN ACT, NOT A SIDE EFFECT. Any monday automation email used to be
+ * able to root a project the ledger did not know, which meant a status change
+ * nobody thought about could quietly start a client-facing conversation. A PM
+ * now toggles a column, that fires the kick-off automation, and only that
+ * email carries:
+ *
+ *     X-G247-Root: 1
+ *
+ * Only an explicit affirmative counts — an unresolved monday token is not a
+ * yes. That mistake has already been made once on this project, with
+ * "X-G247-Recipients: [Item's c. email]" typed instead of inserted.
+ * PURE.
+ */
+function hasRootMarker(html, text) {
+  var sources = [String(html || ''), String(text || '')];
+  for (var i = 0; i < sources.length; i++) {
+    var flat = sources[i]
+      .replace(/<[^>]*>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/[^\S\r\n]+/g, ' ');
+    var m = /X-G247-Root\s*:([^<\n\r]*)/i.exec(flat);
+    if (!m) { continue; }
+    var v = String(m[1] || '').trim().toLowerCase();
+    return v === '1' || v === 'true' || v === 'yes' || v === 'on';
+  }
+  return false;
+}
+
+/**
  * The monday item id a message is addressed at, from its own ingest address.
  * ONE regex, used by classify() and by the caller that has to look the item up
  * before calling it — two copies would drift and the seeding guard depends on
@@ -272,6 +340,28 @@ function pulseItemIdFrom(to, cc) {
  *           capped:boolean, hasMore:boolean, rawHistoryCount:number,
  *           recordsConsumed:number, eventsScanned:number}}
  */
+/**
+ * Fold item-addressed message ids into the history candidates.
+ *
+ * Ids already found by history win — they carry a thread id and a history id
+ * the sweep does not have. Anything new is appended with an empty tid, which
+ * is harmless: the caller uses the fetched message's own threadId and only
+ * falls back to cand.tid.
+ * PURE.
+ */
+function mergeItemMailCandidates(items, ids) {
+  var out = (items || []).slice();
+  var seen = {};
+  out.forEach(function (c) { if (c && c.mid) { seen[String(c.mid)] = true; } });
+  (ids || []).forEach(function (id) {
+    var k = String(id || '');
+    if (!k || seen[k]) { return; }
+    seen[k] = true;
+    out.push({ mid: k, tid: '', hid: '' });
+  });
+  return out;
+}
+
 function extractCandidates(raw, startHistoryId) {
   var obj = raw;
   if (typeof obj === 'string') {
@@ -493,6 +583,7 @@ function classifyMessage(input) {
   // bypass branch below.
   var bypassItemKnown = (input.bypassItemKnown === true ||
                          input.bypassItemKnown === 'true');
+  var rootMarker = (input.rootMarker === true || input.rootMarker === 'true');
 
   var labelIds = labelIdsCsv ? String(labelIdsCsv).split(',') : [];
   var labelNames = labelIds.map(function (id) { return labelMap[id] || id; });
@@ -567,14 +658,36 @@ function classifyMessage(input) {
     // forever. Seeding without checking both would repoint a project's anchor
     // at a newer message on every status change — a write that reads as success
     // and silently detaches the thread the client is actually replying on.
-    if (!threadKnown && !bypassItemKnown) {
+    // ONLY THE FIRST MESSAGE OF A THREAD MAY BE ITS ROOT.
+    //
+    // Gmail sets threadId to the id of the thread's first message, so
+    // threadId === id is exactly "this is the root". Without this test a REPLY
+    // could seed: Gmail quotes the message being replied to, so the client's
+    // "thanks, will do" carries the kick-off's X-G247-Root line inside the
+    // quoted block. If the kick-off had not been seeded yet — which is the
+    // normal state for the few minutes before a pass runs — the reply would
+    // root the project on ITSELF, putting the anchor mid-conversation and
+    // orphaning everything above it.
+    var isThreadRoot = !!threadIdIn && String(threadIdIn) === String(messageIdIn);
+
+    if (rootMarker && isThreadRoot && !threadKnown && !bypassItemKnown) {
       classification = 'seed-monday-created-item';
       detail = 'itemId=' + bypassMatch[1] +
-               '; item has no gmail thread — rooting it on this message';
+               '; kick-off marked as thread root — rooting the project here';
     } else {
       classification = 'bypass-monday-intake';
       detail = 'itemId=' + bypassMatch[1] +
-               (threadKnown ? '; thread already anchored' : '; item already indexed');
+               (threadKnown ? '; thread already anchored'
+                : bypassItemKnown ? '; item already indexed'
+                : (rootMarker && !isThreadRoot)
+                  ? '; carries a root marker but is a reply, not the thread root ' +
+                    '— almost certainly a quoted kick-off. Not rooting.'
+                // The common case, and it must be legible: an ordinary status
+                // email for a project nobody has rooted. Not an error — the
+                // project simply has no thread and will not get one until a PM
+                // sends the kick-off.
+                : '; no thread for this item and no X-G247-Root marker — ' +
+                  'not rooting. Send the kick-off email to start its thread.');
     }
 
   } else if (alreadyProcessed) {
@@ -1702,6 +1815,31 @@ function runIntake(deps, opts) {
   }
 
   var extracted = extractCandidates(raw, startHistoryId);
+
+  // SECOND CANDIDATE SOURCE. A kick-off is unlabelled and is the first message
+  // of its own thread, so the history filter never admits it — see
+  // MONDAY_ITEM_HOST. Failures here must not take the pass down with them: the
+  // label path is the one four PMs depend on.
+  try {
+    var swept = deps.gmail.itemAddressedMessageIds
+      ? deps.gmail.itemAddressedMessageIds() : [];
+    var before = extracted.items.length;
+    extracted.items = mergeItemMailCandidates(extracted.items, swept);
+    extracted.count = extracted.items.length;
+    if (extracted.items.length > before) {
+      log.info('item-mail', {
+        mailbox: mailbox,
+        detail: 'swept ' + (extracted.items.length - before) +
+                ' message(s) addressed at a monday item that history did not offer'
+      });
+    }
+  } catch (e) {
+    log.error('item-mail', {
+      mailbox: mailbox, detail: 'sweep failed, continuing on history alone: ' +
+      (e && e.message)
+    });
+  }
+
   summary.candidates = extracted.count;
 
   if (extracted.count === 0) {
@@ -1761,7 +1899,8 @@ function runIntake(deps, opts) {
         alreadyProcessed: ledger.hasMessage(headerMessageId),
         threadKnown: !!ledger.threadAnchor(msg.threadId || cand.tid),
         threadAnchorItemId: ledger.threadAnchor(msg.threadId || cand.tid),
-        bypassItemKnown: !!ledger.itemThread(pulseItemIdFrom(msg.to, msg.cc))
+        bypassItemKnown: !!ledger.itemThread(pulseItemIdFrom(msg.to, msg.cc)),
+        rootMarker: hasRootMarker(msg.bodyHtml, msg.bodyText)
       });
 
       log.decision({
@@ -1937,10 +2076,19 @@ function applyDecision(deps, ctx, summary) {
     // point: the relay runs as projects@ and can never know a threadId that
     // means anything to the PM.
     //
-    // No participants row. Participants are collected from real correspondence;
-    // this message is machine mail addressed to the item and the PM, and
-    // seeding it would put the automation's own recipients into the list the
-    // relay falls back on when the routing line is missing.
+    // A PARTICIPANTS ROW, so a kick-off-rooted project behaves like a tagged
+    // one. This was deliberately omitted at first, on the grounds that the
+    // kick-off is machine mail. That was wrong once the kick-off carries a real
+    // client: without the row the thread has no participants, so an approval
+    // email whose routing line is missing or broken finds nobody and the relay
+    // returns 'no-recipients-in-ledger' — the client hears nothing, silently.
+    //
+    // collectParticipants already drops the pulse- address, and the relay's
+    // clientRecipients() drops projects@ and the client-relay marker at the
+    // point of use. What survives is the PM and the client, which is the true
+    // participant list for this thread. Filtering here as well would duplicate
+    // that logic across two script projects that cannot share code — the same
+    // trap the audit constants are already in.
     var seedItemId = String((d.detail.match(/itemId=(\d+)/) || [])[1] || '');
     if (seedItemId) {
       var seed = {
@@ -1953,6 +2101,12 @@ function applyDecision(deps, ctx, summary) {
       deps.ledger.stageMessage(seed);
       deps.ledger.stageThreadAnchor(seed);
       deps.ledger.stageItemIndex(seed);
+      deps.ledger.stageParticipants({
+        threadId: msg.threadId, mondayItemId: seedItemId, mailbox: ctx.mailbox,
+        gmailMessageId: ctx.candidate.mid, boardId: d.targetBoardId,
+        subject: msg.subject, createdAt: ctx.now(),
+        participants: collectParticipants(msg.from, msg.to, msg.cc)
+      });
       summary.seeded = (summary.seeded || 0) + 1;
     }
 
@@ -2097,6 +2251,18 @@ function createGmailService() {
     },
 
     /** {labelMap, userLabelMap} — user labels are the ones matched to boards. */
+    /**
+     * Message ids addressed at a monday item. The second candidate source —
+     * see MONDAY_ITEM_HOST. Ids only; the caller fetches and classifies them
+     * exactly like any other candidate.
+     */
+    itemAddressedMessageIds: function () {
+      var res = Gmail.Users.Messages.list('me', {
+        q: ITEM_MAIL_QUERY, maxResults: ITEM_MAIL_MAX
+      });
+      return ((res && res.messages) || []).map(function (m) { return m.id; });
+    },
+
     labelsList: function () {
       var res = Gmail.Users.Labels.list('me');
       var labelMap = {};
@@ -2387,6 +2553,23 @@ function createMondayClient(token) {
 
   return {
     gql: gql,
+
+    /**
+     * WHICH monday USER THIS TOKEN IS.
+     *
+     * monday attributes every write to the token's owner and offers no way to
+     * set an update's creator, so this identity IS the name on every update the
+     * bridge writes. Tokens are personal: one taken from Admin -> API, or from
+     * your own Developer page while intending to act as a service account,
+     * still resolves to you — and the only symptom is the wrong name on the
+     * board, hours later, mixed in with correctly-attributed rows written by
+     * monday's own email ingestion. Ask the API rather than the intention.
+     */
+    whoAmI: function () {
+      var d = gql('query { me { id name email } }', {});
+      return (d && d.me) || null;
+    },
+
 
     /**
      * {lowercased board name: {id, name}} across ALL boards.
@@ -3663,11 +3846,38 @@ function removeAllTriggers() {
 // --------------------------------------------------------- SETUP / DIAGNOSTIC
 /** Run once by hand. Confirms scopes, mailbox, sheet access and board matching. */
 function preflight() {
-  var out = { ok: true, checks: [] };
+  var out = { build: BUILD, ok: true, checks: [] };
   function ck(name, fn) {
     try { out.checks.push({ name: name, result: String(fn()) }); }
     catch (e) { out.ok = false; out.checks.push({ name: name, error: String(e && e.message) }); }
   }
+  ck('build', function () { return BUILD; });
+  ck('seeding available', function () {
+    return (typeof hasRootMarker === 'function' && typeof pulseItemIdFrom === 'function')
+      ? 'yes — a marked kick-off can root a monday-created project'
+      : 'NO — this build cannot root anything; paste the current Code.gs';
+  });
+  ck('monday token identity', function () {
+    var tok = props_().getProperty(PROP_MONDAY_TOKEN);
+    if (!tok) { throw new Error(PROP_MONDAY_TOKEN + ' is not set'); }
+    var me = createMondayClient(tok).whoAmI();
+    if (!me) { throw new Error('monday returned no identity for this token'); }
+    var expected = INTEGRATION_USER_IDS[0];
+    // THROWS rather than returning a warning string. A check that prints
+    // "*** NOT the service account ***" while the run reports ok:true is the
+    // read-as-success shape this project keeps being bitten by — the first
+    // version of this very check did it.
+    if (String(me.id) !== String(expected)) {
+      throw new Error('token belongs to ' + me.name + ' <' + me.email + '> id=' +
+        me.id + ', not the service account (' + expected + '). Every update the ' +
+        'bridge writes will be authored by them. monday tokens are PERSONAL: ' +
+        'one taken from your own Developer page or from Admin -> API resolves ' +
+        'to you whichever account you meant. Sign in AS the service account and ' +
+        'create the token from that session.');
+    }
+    return me.name + ' <' + me.email + '> id=' + me.id +
+      ' — every update will be authored by this user';
+  });
   ck('gmail profile', function () { return createGmailService().getProfileEmail(); });
   ck('mailbox on allow-list', function () {
     var m = createGmailService().getProfileEmail().toLowerCase();
@@ -3918,4 +4128,3 @@ function verifyInstall() {
 
   return out;
 }
-
