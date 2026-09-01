@@ -43,6 +43,9 @@
 // ============================================================ CONFIGURATION
 
 /** 'internal' | 'client'. THE ONLY LINE THAT DIFFERS BETWEEN THE TWO COPIES. */
+/** Which build is pasted in the editor. Printed by relayPreflight(). */
+var BUILD = 'relay 2026-08-29 root-marker+cursor-safety';
+
 var ROUTE = 'client';
 
 /**
@@ -171,6 +174,26 @@ var RECIPIENTS_LINE_TAG = 'X-G247-Recipients';
  * MUST be stripped before relaying — it is plumbing, like the routing line.
  */
 var HTML_LINE_TAG = 'X-G247-HTML';
+
+/**
+ * THE ONLY THING THAT MAY ROOT A PROJECT'S THREAD.
+ *
+ * Rooting used to happen on any monday automation email for an item the ledger
+ * did not know. That is too generous: a status change nobody thought about
+ * would quietly start a client-facing conversation. Rooting is now deliberate —
+ * a PM toggles a column, that fires the kick-off automation, and the kick-off
+ * body carries:
+ *
+ *     X-G247-Root: 1
+ *
+ * The intake seeds only on that line. The relay reads it too, for one reason:
+ * to know whether waiting is worth it. Without the line an unrooted item is
+ * never going to be rooted, so holding the cursor for the grace window would be
+ * waiting for something that is not coming.
+ *
+ * Plumbing, so stripped from any relayed copy like the other two lines.
+ */
+var ROOT_LINE_TAG = 'X-G247-Root';
 
 /**
  * The ONLY tags that survive. Everything else is escaped and shown literally,
@@ -427,7 +450,11 @@ function stripTaggedLine(body, tag) {
 
 /** Both plumbing lines removed. The only stripper the send path should call. */
 function stripRelayPlumbing(body) {
-  return stripTaggedLine(stripTaggedLine(body, RECIPIENTS_LINE_TAG), HTML_LINE_TAG);
+  var s = body;
+  [RECIPIENTS_LINE_TAG, HTML_LINE_TAG, ROOT_LINE_TAG].forEach(function (tag) {
+    s = stripTaggedLine(s, tag);
+  });
+  return s;
 }
 
 function stripRecipientsLine(body) {
@@ -460,14 +487,14 @@ function escapeHtml(s) {
  * that mistake is exactly how the routing line silently fell back for two days.
  * PURE.
  */
-function parseHtmlOptIn(html, text) {
+function parseFlagLine(tag, html, text) {
   var sources = [String(html || ''), String(text || '')];
   for (var i = 0; i < sources.length; i++) {
     var flat = sources[i]
       .replace(/<[^>]*>/g, ' ')
       .replace(/&nbsp;/gi, ' ')
       .replace(/[^\S\r\n]+/g, ' ');
-    var m = new RegExp(HTML_LINE_TAG + '\\s*:([^<\\n\\r]*)', 'i').exec(flat);
+    var m = new RegExp(tag + '\\s*:([^<\\n\\r]*)', 'i').exec(flat);
     if (!m) { continue; }
     var v = String(m[1] || '').trim().toLowerCase();
     if (v === '1' || v === 'true' || v === 'yes' || v === 'on') { return true; }
@@ -475,6 +502,11 @@ function parseHtmlOptIn(html, text) {
   }
   return false;
 }
+
+function parseHtmlOptIn(html, text) { return parseFlagLine(HTML_LINE_TAG, html, text); }
+
+/** Did a PM deliberately mark this email as the root of the project's thread? PURE. */
+function parseRootMarker(html, text) { return parseFlagLine(ROOT_LINE_TAG, html, text); }
 
 /**
  * Render a PLAIN-TEXT body that was authored as HTML.
@@ -591,10 +623,18 @@ function buildRelayMime(a, b64) {
   var lines = [];
   lines.push('To: ' + a.to);
   lines.push('Subject: ' + encodeSubject(replySubject(a.threadSubject), b64));
-  // REPLY-TO IS WHAT KEEPS THE LOOP CLOSED. The copy is sent from projects@,
-  // which no PM reads and which the intake — running as the PM — would never
-  // ingest. Without this header a client's reply lands nowhere and silently
-  // never reaches the monday item.
+  // REPLY-TO IS WHAT KEEPS THE LOOP CLOSED, ON BOTH ROUTES.
+  //
+  // The copy is sent from projects@, which no PM reads and which the intake —
+  // running as the PM — would never ingest. Without this header a reply lands
+  // there and silently never reaches the monday item.
+  //
+  // It used to be set on the client route only, on the reasoning that the
+  // internal route already mails the PM directly. But a PM replying to an
+  // internal notification hit the same dead end: no Reply-To, so plain Reply
+  // went to projects@ and was lost. Pointed at the PM it lands back in their
+  // own mailbox on a thread the ledger knows, which the intake appends to the
+  // item — so replying to a notification becomes a way to add a note.
   if (a.replyTo) { lines.push('Reply-To: ' + a.replyTo); }
   var ref = '<' + String(a.headerMessageId || '').replace(/^<|>$/g, '') + '>';
   lines.push('In-Reply-To: ' + ref);
@@ -610,12 +650,23 @@ function buildRelayMime(a, b64) {
   return lines.join('\r\n');
 }
 
-/** A banner saying where this came from, then monday's own message. PURE. */
+/**
+ * The automation's own subject as a heading, then monday's message.
+ *
+ * WHAT THIS DELIBERATELY DOES NOT SAY. It used to carry "monday automation ·
+ * item <id>" and "sent to <addresses>". Both went to clients: the first shows
+ * them an internal record id and tells them they are looking at machine output,
+ * and the second shows every client on a project the other clients' addresses.
+ * Neither was ever for them — it was diagnostics, and diagnostics belong in the
+ * state sheet, which records itemId, toMailbox and detail on every send.
+ *
+ * The subject stays because the thread's own subject is the project name, so
+ * without it nothing distinguishes an approval request from a rejection notice.
+ * PURE.
+ */
 function relayBody(a) {
   var head = '<div style="color:#666;font-size:12px;border-left:3px solid #ccc;padding-left:8px;margin-bottom:12px">' +
-    'monday automation &middot; item ' + escapeHtml(String(a.itemId || '')) +
-    '<br><b>' + escapeHtml(a.originalSubject || '(no subject)') + '</b>' +
-    (a.sentTo ? '<br>sent to ' + escapeHtml(a.sentTo) : '') +
+    '<b>' + escapeHtml(a.originalSubject || '(no subject)') + '</b>' +
     '</div>';
   // A real text/html part always wins — it is already markup and needs no
   // reconstruction. The opt-in only rescues the text/plain-only case, which is
@@ -833,6 +884,36 @@ function healthMessage(h) {
   return out.join('\n');
 }
 
+/**
+ * Items that a kick-off in THIS batch is about to root.
+ *
+ * The kick-off is split in two, both fired by the same column change:
+ *
+ *   1. the ROOT email — PM and pulse-<item>@ only, carrying X-G247-Root. The
+ *      client never sees it; it exists so the intake can anchor the project.
+ *   2. the CLIENT kick-off — an ordinary client-route automation, which the
+ *      relay threads onto (1) and sends with a correct Reply-To.
+ *
+ * (2) deliberately does NOT carry the root marker: it never reaches the PM's
+ * mailbox, so it could not root anything, and giving it the marker would make
+ * one line mean two different things. But without it the relay would drop (2)
+ * on the pass before the intake has anchored (1) — the client's kick-off, gone
+ * silently, which is the failure mode this whole system keeps producing.
+ *
+ * So the batch is read twice. Anything a young root email in this same window
+ * is about to anchor waits with it, and they are released together.
+ * PURE.
+ */
+function itemsAwaitingRoot(metas, nowMs, graceMs) {
+  var out = {};
+  (metas || []).forEach(function (m) {
+    if (!m || !m.ok || m.rootMarker !== true) { return; }
+    if (!m.internalDate || (nowMs - m.internalDate) >= graceMs) { return; }
+    extractPulseItemIds(m.addresses).forEach(function (id) { out[String(id)] = true; });
+  });
+  return out;
+}
+
 // ============================================================== ORCHESTRATOR
 
 /**
@@ -902,8 +983,17 @@ function runRelayPass(deps, opts) {
   // sheet, which is what makes not advancing safe.
   var pageDrained = !page.hasMore && ids.length <= MAX_BATCH;
 
-  for (var i = 0; i < ids.length && i < MAX_BATCH; i++) {
-    var m = deps.gmail.messageMeta(ids[i]);
+  // Fetched up front rather than inside the loop: the batch has to be read
+  // twice, once to find what is mid-rooting and once to act. Same number of
+  // fetches, just ordered differently.
+  var metas = [];
+  for (var f = 0; f < ids.length && f < MAX_BATCH; f++) {
+    metas.push(deps.gmail.messageMeta(ids[f]));
+  }
+  var awaitingRoot = itemsAwaitingRoot(metas, deps.nowMs(), SEED_GRACE_MS);
+
+  for (var i = 0; i < metas.length; i++) {
+    var m = metas[i];
     if (!m || !m.ok) { note('fetch-failed'); continue; }
 
     var verdict = shouldRelay(m, {
@@ -919,8 +1009,9 @@ function runRelayPass(deps, opts) {
     // breaking would park every other item behind one unrooted project for the
     // whole grace window.
     if (!verdict.relay && verdict.reason === 'item-has-no-gmail-thread' &&
+        (m.rootMarker === true || awaitingRoot[String(verdict.itemId)] === true) &&
         m.internalDate && (deps.nowMs() - m.internalDate) < SEED_GRACE_MS) {
-      note('awaiting-intake-seed');
+      note('awaiting-intake-seed');   // only ever a kick-off; see ROOT_LINE_TAG
       pageDrained = false;
       deps.log('info', 'item ' + verdict.itemId + ' has no anchor yet and this ' +
         'automation email is ' + Math.round((deps.nowMs() - m.internalDate) / 1000) +
@@ -961,7 +1052,7 @@ function runRelayPass(deps, opts) {
 
     var raw = buildRelayMime({
       to: toLine,
-      replyTo: (ROUTE === 'client') ? verdict.anchor.mailbox : '',
+      replyTo: verdict.anchor.mailbox,
       threadSubject: verdict.anchor.subject,
       headerMessageId: verdict.anchor.headerMessageId,
       itemId: verdict.itemId,
@@ -1164,7 +1255,8 @@ function gmailService_() {
         bodyHtml: html,
         bodyText: text,
         recipientsLine: parseRecipientsLine(html, text),
-        htmlOptIn: parseHtmlOptIn(html, text)
+        htmlOptIn: parseHtmlOptIn(html, text),
+        rootMarker: parseRootMarker(html, text)
       };
     },
 
@@ -1431,11 +1523,17 @@ function installHealthTrigger() {
 
 /** Scopes, mailbox, ledger access, state sheet, mode. Writes nothing. */
 function relayPreflight() {
-  var out = { route: ROUTE, ok: true, checks: [] };
+  var out = { build: BUILD, route: ROUTE, ok: true, checks: [] };
   function ck(name, fn) {
     try { out.checks.push({ name: name, result: String(fn()) }); }
     catch (e) { out.ok = false; out.checks.push({ name: name, error: String(e && e.message) }); }
   }
+  ck('build', function () { return BUILD; });
+  ck('kick-off rooting supported', function () {
+    return (typeof parseRootMarker === 'function')
+      ? 'yes — holds for a marked kick-off, suppresses the root'
+      : 'NO — paste the current Relay file';
+  });
   ck('gmail profile', function () { return gmailService_().profile(); });
   ck('mailbox is projects@', function () {
     var m = gmailService_().profile().toLowerCase();
@@ -1464,7 +1562,18 @@ function relayPreflight() {
   });
   ck('relay mode', function () { return props_().getProperty(PROP_RELAY_MODE) || 'off (unset)'; });
   ck('cursor', function () {
-    return PropertiesService.getUserProperties().getProperty(CURSOR_KEY) || '(unseeded)';
+    // THE CURSOR IS PER-GOOGLE-ACCOUNT (UserProperties), and the pass always
+    // runs as projects@. Read by anyone else it reports '(unseeded)' for their
+    // own empty store, which reads as "the relay has lost its place" and is
+    // not true. Say so rather than print a number that means nothing.
+    var v = PropertiesService.getUserProperties().getProperty(CURSOR_KEY);
+    var me = '';
+    try { me = String(gmailService_().profile() || '').toLowerCase(); } catch (e) { me = ''; }
+    if (me !== EXPECTED_MAILBOX.toLowerCase()) {
+      return '(not readable as ' + (me || 'this account') + ' — the cursor belongs to ' +
+        EXPECTED_MAILBOX + '. Sign in as that account to see it.)';
+    }
+    return v || '(unseeded)';
   });
   console.log(JSON.stringify(out, null, 2));
   return out;
