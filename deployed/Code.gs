@@ -107,7 +107,7 @@ var INTEGRATION_USER_IDS = [
  * code. preflight() now prints this, so the question is a five-second check.
  * Bump it with any change worth telling apart.
  */
-var BUILD = 'intake 2026-09-01c seed-on-kickoff+participants+itemmail-sweep+clientservice-id+token-identity';
+var BUILD = 'intake 2026-09-14 threadid-by-title+stamp-on-seed+relabel-after-unmatched+seed-on-kickoff+itemmail-sweep+clientservice-id+token-identity';
 
 /**
  * The host monday gives each item as its own ingest address.
@@ -153,6 +153,50 @@ var COLUMNS = {
   gmailSyncMessage: 'long_text_mm5xcds9',
   gmailSyncStatus: 'color_mm5x50bt'
 };
+
+/**
+ * COLUMNS BY TITLE, for boards that did not get the canonical ids.
+ *
+ * COLUMNS pins ids because monday keeps them across board duplication, which
+ * is how the test and live boards share them. A column added by hand in the
+ * UI gets a fresh id ("Thread ID" on TEST Board came out as text_mm76gytt), so
+ * on that board the id lookup misses and the value is silently skipped. The
+ * title is the second key: an exact, case-insensitive match on any of these
+ * resolves the column when the id is absent. The id still wins when present.
+ */
+var COLUMN_TITLES = {
+  gmailThreadId: ['Thread ID', 'Gmail Thread ID'],
+  gmailRootMessageId: ['Root Message-ID', 'Gmail Root Message-ID'],
+  lastGmailSync: ['Last Gmail Sync'],
+  gmailSyncMessage: ['Gmail Sync Message'],
+  gmailSyncStatus: ['Gmail Sync Status']
+};
+
+/**
+ * Resolve every COLUMNS key against one board's columns: id first, title
+ * second. `boardColumns` is [{id, title}] (or bare ids, for older callers and
+ * tests — then only ids can match). Returns {key: columnId} for what exists.
+ */
+function resolveColumns(boardColumns) {
+  var byId = {}; var byTitle = {};
+  (boardColumns || []).forEach(function (c) {
+    if (!c) { return; }
+    if (typeof c === 'string') { byId[c] = c; return; }
+    if (c.id) { byId[String(c.id)] = String(c.id); }
+    if (c.title) { byTitle[String(c.title).trim().toLowerCase()] = String(c.id); }
+  });
+  var out = {};
+  Object.keys(COLUMNS).forEach(function (key) {
+    var id = COLUMNS[key];
+    if (byId[id]) { out[key] = id; return; }
+    var titles = COLUMN_TITLES[key] || [];
+    for (var i = 0; i < titles.length; i++) {
+      var hit = byTitle[titles[i].toLowerCase()];
+      if (hit) { out[key] = hit; return; }
+    }
+  });
+  return out;
+}
 
 /** Contacts board behind the C. Contact relation. Match on the `email` column. */
 var CONTACTS_BOARD_ID = '4152280281';
@@ -785,17 +829,21 @@ function classifyMessage(input) {
  */
 function buildColumnValues(boardColumnIds, ctx) {
   ctx = ctx || {};
-  var present = {};
-  (boardColumnIds || []).forEach(function (id) { present[id] = true; });
+  var resolved = resolveColumns(boardColumnIds);
 
   var out = {};
   var written = [];
   var skipped = [];
 
+  // `columnId` is the canonical id from COLUMNS; what gets written is whatever
+  // that key resolved to on THIS board (same id, or the title match).
   function put(columnId, value, label) {
     if (value === null || value === undefined || value === '') { return; }
-    if (!present[columnId]) { skipped.push(label + ' (' + columnId + ')'); return; }
-    out[columnId] = value;
+    var key = null;
+    Object.keys(COLUMNS).forEach(function (k) { if (COLUMNS[k] === columnId) { key = k; } });
+    var target = key ? resolved[key] : null;
+    if (!target) { skipped.push(label + ' (' + columnId + ')'); return; }
+    out[target] = value;
     written.push(label);
   }
 
@@ -1055,7 +1103,19 @@ function createLedger(adapter) {
     hasMessage: function (headerMessageId) {
       var key = normalizeMessageId(headerMessageId);
       if (!key) { return false; }
-      return !!ensureLoaded().byMessage[key];
+      var row = ensureLoaded().byMessage[key];
+      // ONLY A MESSAGE THAT REACHED MONDAY COUNTS AS PROCESSED.
+      //
+      // Until 11 Sep every decision was recorded, including 'unmatched-no-board'
+      // — the state a PM is expected to CHANGE by adding the label. In David's
+      // mailbox Outlook folder rules put a user label ("Inbox/3 Per") on mail
+      // as it arrives, so every email was classified unmatched within a minute
+      // of landing, recorded, and then permanently ignored when he labelled it
+      // for the board: 'skipped-already-processed; would have targeted iNova AU
+      // NEW'. Rows without an item id are exactly those non-decisions, and they
+      // are not allowed to block. The historical rows stay in the sheet as an
+      // audit trail; this reading makes them inert.
+      return !!(row && String(row.mondayItemId || '').trim());
     },
 
     /** Item id anchored to a Gmail thread, or '' when the thread is unknown. */
@@ -2108,14 +2168,36 @@ function applyDecision(deps, ctx, summary) {
         participants: collectParticipants(msg.from, msg.to, msg.cc)
       });
       summary.seeded = (summary.seeded || 0) + 1;
+
+      // THE ONE MONDAY WRITE ON THIS PATH: Thread ID (and Root Message-ID) on
+      // the item, so a board condition can tell a rooted project from an
+      // unrooted one. Best-effort — a failure here must not undo the seed.
+      if (deps.writer && deps.writer.stampThread) {
+        try {
+          deps.writer.stampThread({
+            itemId: seedItemId, boardId: d.targetBoardId || '',
+            threadId: msg.threadId, headerMessageId: ctx.rawMessageId || ctx.headerMessageId
+          });
+        } catch (e) {
+          deps.log.warn('stamp', { itemId: seedItemId, mailbox: ctx.mailbox,
+            detail: 'could not write Thread ID to the item: ' + (e && e.message) });
+        }
+      }
     }
 
   } else {
     // Everything else is a decision NOT to act. Record the message so the same
-    // decision is not recomputed forever — except for transient failures, where
-    // recording it would permanently suppress a message that might succeed next
-    // time.
-    if (d.classification !== 'skipped-fetch-failed') {
+    // decision is not recomputed forever — except where the decision is one a
+    // person is meant to change. 'unmatched-no-board' means "no board label
+    // YET": the PM adds one and the message must then be treated as new. Same
+    // for an ambiguous pair of labels the PM will fix. And transient failures,
+    // where recording would permanently suppress a message that might succeed
+    // next time. hasMessage() ignores item-less rows anyway; not writing them
+    // also keeps David's Outlook-labelled inbox from filling the ledger with a
+    // row per email.
+    if (d.classification !== 'skipped-fetch-failed' &&
+        d.classification !== 'unmatched-no-board' &&
+        d.classification !== 'skipped-ambiguous-multi-board') {
       deps.ledger.stageMessage({
         mondayItemId: '', mailbox: ctx.mailbox,
         threadId: msg.threadId, headerMessageId: ctx.headerMessageId,
@@ -2627,9 +2709,26 @@ function createMondayClient(token) {
 
     /** Column ids present on a board — drives write-what-exists. */
     boardColumnIds: function (boardId) {
-      var data = gql('query($id:[ID!]){ boards(ids:$id){ columns{ id } } }', { id: [String(boardId)] });
+      var data = gql('query($id:[ID!]){ boards(ids:$id){ columns{ id title } } }', { id: [String(boardId)] });
       var b = data && data.boards && data.boards[0];
-      return ((b && b.columns) || []).map(function (c) { return c.id; });
+      return ((b && b.columns) || []).map(function (c) { return { id: String(c.id), title: String(c.title || '') }; });
+    },
+
+    /** Which board an item lives on. '' when the item is gone or unreadable. */
+    itemBoardId: function (itemId) {
+      var data = gql('query($id:[ID!]){ items(ids:$id){ board{ id } } }', { id: [String(itemId)] });
+      var it = data && data.items && data.items[0];
+      return (it && it.board && it.board.id) ? String(it.board.id) : '';
+    },
+
+    /** Write column values on an existing item. Used to stamp a seeded thread. */
+    changeColumnValues: function (boardId, itemId, columnValues) {
+      var data = gql(
+        'mutation($board:ID!,$item:ID!,$cols:JSON!){' +
+        ' change_multiple_column_values(board_id:$board, item_id:$item, column_values:$cols){ id } }',
+        { board: String(boardId), item: String(itemId), cols: JSON.stringify(columnValues || {}) }
+      );
+      return String(data.change_multiple_column_values.id);
     },
 
     /** Contacts lookup by email. Returns '' when unmatched — never creates. */
@@ -2912,6 +3011,39 @@ function createWriter(monday, gmail, log) {
       }
 
       return { itemId: itemId, updateId: updateId, attachments: attach, columns: built, pmDropped: pmDropped };
+    },
+
+    /**
+     * Stamp a seeded project with its Gmail thread, the same two columns a
+     * label-created project gets at creation. This is what makes a monday
+     * condition "only if Thread ID is empty" true in both directions: no
+     * thread yet — send the kick-off; thread exists — don't. Best-effort:
+     * the ledger rows are the system of record, the columns are for humans
+     * and automations, and a board without the columns simply writes nothing.
+     */
+    stampThread: function (a) {
+      // A seed arrives with no board: the kick-off carries an item address,
+      // not a label. One read resolves it.
+      var boardId = a.boardId || monday.itemBoardId(a.itemId);
+      if (!boardId) { return { stamped: [], reason: 'item has no board' }; }
+      a = Object.assign({}, a, { boardId: boardId });
+      var cols = boardColumns(a.boardId);
+      var resolved = resolveColumns(cols);
+      var values = {};
+      if (resolved.gmailThreadId && a.threadId) { values[resolved.gmailThreadId] = String(a.threadId); }
+      if (resolved.gmailRootMessageId && a.headerMessageId) {
+        values[resolved.gmailRootMessageId] = String(a.headerMessageId);
+      }
+      var keys = Object.keys(values);
+      if (!keys.length) {
+        note('info', 'stamp', { itemId: a.itemId, boardId: a.boardId,
+          detail: 'board has no Thread ID / Root Message-ID column; nothing to stamp' });
+        return { stamped: [] };
+      }
+      monday.changeColumnValues(a.boardId, a.itemId, values);
+      note('info', 'stamp', { itemId: a.itemId, boardId: a.boardId, threadId: a.threadId,
+        detail: 'wrote ' + keys.join(', ') });
+      return { stamped: keys };
     },
 
     /** Append one email to an existing item as an update. */
@@ -3809,7 +3941,8 @@ function createWriter_(deps) {
   return {
     createProject: function (a) { return callWebApp_('createProject', a); },
     appendUpdate: function (a) { return callWebApp_('appendUpdate', a); },
-    deadLetter: function (a) { return callWebApp_('deadLetter', a); }
+    deadLetter: function (a) { return callWebApp_('deadLetter', a); },
+    stampThread: function (a) { return callWebApp_('stampThread', a); }
   };
 }
 
@@ -3995,6 +4128,9 @@ function dispatchWebAppAction_(action, payload) {
 
     case 'deadLetter':
       return createWriter(monday, nullGmail_(), null).deadLetter(payload);
+
+    case 'stampThread':
+      return createWriter(monday, nullGmail_(), null).stampThread(payload);
 
     default:
       throw new Error('unknown action: ' + action);
