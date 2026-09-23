@@ -107,7 +107,7 @@ var INTEGRATION_USER_IDS = [
  * code. preflight() now prints this, so the question is a five-second check.
  * Bump it with any change worth telling apart.
  */
-var BUILD = 'intake 2026-09-14 threadid-by-title+stamp-on-seed+relabel-after-unmatched+seed-on-kickoff+itemmail-sweep+clientservice-id+token-identity';
+var BUILD = 'intake 2026-09-14b sweep-3h+threadid-by-title+stamp-on-seed+relabel-after-unmatched+seed-on-kickoff+itemmail-sweep+clientservice-id+token-identity';
 
 /**
  * The host monday gives each item as its own ingest address.
@@ -125,7 +125,13 @@ var BUILD = 'intake 2026-09-14 threadid-by-title+stamp-on-seed+relabel-after-unm
  * item, which is precise, cheap, and cannot match anything else.
  */
 var MONDAY_ITEM_HOST = 'g247ww.us.monday.com';
-var ITEM_MAIL_QUERY = 'to:' + MONDAY_ITEM_HOST + ' newer_than:2d -in:chats';
+// WINDOW: 3 hours, not 2 days. Every message this query returns is fetched
+// in full and classified on EVERY pass, and the pass runs once a minute. At
+// 2 days a busy PM mailbox (David's) offered 24-25 item emails per pass and a
+// pass took 20-30 s — ~10 hours of trigger runtime a day against a 6-hour
+// quota. A kick-off only needs to be seen once, within its 30-minute seeding
+// grace; three hours covers a stalled trigger with room to spare.
+var ITEM_MAIL_QUERY = 'to:' + MONDAY_ITEM_HOST + ' newer_than:3h -in:chats';
 var ITEM_MAIL_MAX = 25;
 
 var AUTOMATION_SENDERS = [
@@ -943,6 +949,10 @@ function formatUpdateBody(msg, opts) {
     head += ' &middot; ' + escapeHtml(toMondayDateTime(msg.internalDate)) + ' UTC';
   }
   if (opts.label) { head += ' &middot; ' + escapeHtml(opts.label); }
+  // Recipients, so a reader on the item can tell who the message went to
+  // without opening Gmail. Only rendered when the intake passed them.
+  if (msg.to) { head += '<br><span style="color:#676879">To: ' + escapeHtml(msg.to) + '</span>'; }
+  if (msg.cc) { head += '<br><span style="color:#676879">Cc: ' + escapeHtml(msg.cc) + '</span>'; }
 
   var body;
   if (msg.bodyHtml) {
@@ -1546,13 +1556,27 @@ function createSheetAdapter(spreadsheetId) {
       return out;
     },
 
-    /** Append rows (array of arrays) in one write, under the script lock. */
+    /**
+     * Append rows (array of arrays) in one write, under the script lock.
+     *
+     * getRange() past the sheet's grid throws "The coordinates of the range are
+     * outside the dimensions of the sheet" (seen 21 Sep on the runlog, whose
+     * grid had shrunk to exactly the trim size). The grid is grown first so the
+     * write can never land on the edge. Matters most for the ledger: a failed
+     * ledger append leaves an item in monday with no row, and the next run
+     * creates it again.
+     */
     append: function (name, rows) {
       if (!rows || !rows.length) { return; }
       withLock(function () {
         var sh = ss().getSheetByName(name);
         if (!sh) { throw new Error('sheet "' + name + '" does not exist; call ensureSheet first'); }
-        sh.getRange(sh.getLastRow() + 1, 1, rows.length, rows[0].length).setValues(rows);
+        var start = sh.getLastRow() + 1;
+        var need = start + rows.length - 1 - sh.getMaxRows();
+        if (need > 0) { sh.insertRowsAfter(sh.getMaxRows(), need + 50); }
+        var width = rows[0].length;
+        if (width > sh.getMaxColumns()) { sh.insertColumnsAfter(sh.getMaxColumns(), width - sh.getMaxColumns()); }
+        sh.getRange(start, 1, rows.length, width).setValues(rows);
       });
     },
 
@@ -2038,11 +2062,71 @@ function runIntake(deps, opts) {
   return summary;
 }
 
+/**
+ * CROSS-MAILBOX CLAIM. One email, one monday write, whichever mailbox gets
+ * there first.
+ *
+ * The ledger dedup (hasMessage) is read at classification time and the ledger
+ * row is only flushed at the END of the pass, so when the same reply lands in
+ * two G247 mailboxes (PM + Mark, two PMs on a thread) and both 1-minute
+ * triggers fire in the same minute, both passes see "not in ledger" and both
+ * append the update. Seen live 20 Sep 2026: every reply-all with two G247
+ * recipients produced two identical updates on the item.
+ *
+ * The script cache is shared by every user of this script project, and the
+ * script lock serialises the check-and-set, so the second mailbox sees the
+ * claim before it writes. 6 hours is the cache maximum and far longer than a
+ * pass; by then the ledger row exists and hasMessage() takes over.
+ *
+ * SAME-MAILBOX OVERLAP is covered too. The first version only refused a claim
+ * held by ANOTHER mailbox; on 21 Sep two overlapping runs of the SAME mailbox
+ * both created the item, because the second run loaded the ledger before the
+ * first had flushed. Any live claim now refuses, whoever holds it. A message
+ * is written to monday once, so there is no legitimate second write inside
+ * the claim window; a run that claims and then dies before writing dead-letters
+ * the message, and dead letters are not retried by the next pass anyway.
+ *
+ * Returns true when THIS pass owns the write; false when a claim is already
+ * held (by another mailbox, or by an earlier overlapping pass of this one).
+ */
+var CLAIM_TTL_S = 900;   // longer than any pass; shorter than the 6 h cache cap
+
+function claimMessage_(headerMessageId, mailbox) {
+  var key = 'claim:' + String(headerMessageId || '').toLowerCase();
+  if (key === 'claim:') { return true; }   // nothing to key on; do not block
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(LOCK_WAIT_MS)) {
+    throw new Error('could not acquire script lock for claim within ' + LOCK_WAIT_MS + 'ms');
+  }
+  try {
+    var cache = CacheService.getScriptCache();
+    var owner = cache.get(key);
+    if (owner) { return false; }
+    cache.put(key, mailbox, CLAIM_TTL_S);
+    return true;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 /** Writes for one classified message. Only reached when not in shadow mode. */
 function applyDecision(deps, ctx, summary) {
   var d = ctx.decision;
   var w = deps.writer;
   var msg = ctx.message;
+
+  // Claim before any monday write. See claimMessage_.
+  if (d.classification === 'create-matched-board' ||
+      d.classification === 'append-to-existing-item') {
+    if (!claimMessage_(ctx.headerMessageId, ctx.mailbox)) {
+      deps.log.info('claim', { mailbox: ctx.mailbox, gmailMessageId: ctx.candidate.mid,
+        detail: 'message ' + ctx.headerMessageId + ' already claimed by an earlier or ' +
+                'concurrent pass; skipping to avoid a duplicate ' +
+                (d.classification === 'create-matched-board' ? 'item' : 'update') });
+      summary.skipped = (summary.skipped || 0) + 1;
+      return;
+    }
+  }
 
   if (d.classification === 'create-matched-board') {
     var created = w.createProject({
@@ -2056,6 +2140,8 @@ function applyDecision(deps, ctx, summary) {
       // render as "(no readable message body)" with the text sitting unused on
       // the message object.
       from: msg.from,
+      to: msg.to,
+      cc: msg.cc,
       threadId: msg.threadId,
       headerMessageId: ctx.headerMessageId,
       gmailMessageId: ctx.candidate.mid,
@@ -2096,6 +2182,8 @@ function applyDecision(deps, ctx, summary) {
       // id, and without it every attachment on a reply fails to upload.
       gmailMessageId: ctx.candidate.mid,
       from: msg.from,
+      to: msg.to,
+      cc: msg.cc,
       senderEmail: msg.senderEmail,
       bodyHtml: msg.bodyHtml,
       bodyText: msg.bodyText,
@@ -2954,10 +3042,28 @@ function createWriter(monday, gmail, log) {
                          // that do not define it, and it earns us nothing
       });
 
+      // C. CONTACT IS WRITTEN AFTER CREATION, NOT WITH IT.
+      //
+      // monday raises no "column changed" event for values passed inside
+      // create_item (the activity log shows one create_pulse with the relation
+      // in column_values_json and nothing else), so the board automation
+      // "when C. Contact changes -> Make: Client Contact to Client" never fired
+      // for bridge-created items. That Make run is what fills Client, the
+      // Client text and Group Email; with them empty the board's own checks
+      // ("missing Client information") clear P. Template (NEW) the moment a PM
+      // picks it. Seen live 21 Sep on P261579 / P261580. A second write after
+      // creation is an ordinary column change and fires the automation.
+      var createValues = {};
+      var contactValue = null;
+      Object.keys(built.columnValues).forEach(function (k) {
+        if (k === COLUMNS.clientContact) { contactValue = built.columnValues[k]; }
+        else { createValues[k] = built.columnValues[k]; }
+      });
+
       var itemId;
       var pmDropped = '';
       try {
-        itemId = monday.createItem(a.boardId, a.groupId, a.itemName, built.columnValues);
+        itemId = monday.createItem(a.boardId, a.groupId, a.itemName, createValues);
       } catch (e) {
         // INVALID PERSON ASSIGNMENT.
         // monday refuses to assign a person to a People column unless that
@@ -2967,8 +3073,8 @@ function createWriter(monday, gmail, log) {
         // that one column, keep everything else, and say so loudly.
         if (!isPersonAssignmentError(e) || !built.columnValues[COLUMNS.g247pm]) { throw e; }
         var retry = {};
-        Object.keys(built.columnValues).forEach(function (k) {
-          if (k !== COLUMNS.g247pm) { retry[k] = built.columnValues[k]; }
+        Object.keys(createValues).forEach(function (k) {
+          if (k !== COLUMNS.g247pm) { retry[k] = createValues[k]; }
         });
         itemId = monday.createItem(a.boardId, a.groupId, a.itemName, retry);
         pmDropped = String((e && e.message) || e).slice(0, 200);
@@ -2979,6 +3085,19 @@ function createWriter(monday, gmail, log) {
           detail: 'G247 PM NOT SET — add ' + a.mailbox + ' as a subscriber of this board, ' +
             'then set the column by hand. monday said: ' + pmDropped
         });
+      }
+
+      if (contactValue) {
+        try {
+          var contactWrite = {};
+          contactWrite[COLUMNS.clientContact] = contactValue;
+          monday.changeColumnValues(a.boardId, itemId, contactWrite);
+        } catch (e) {
+          // The item exists; a missing contact link is a PM fix, not a lost project.
+          built.written = built.written.filter(function (w) { return w !== 'C. Contact'; });
+          built.skipped.push('C. Contact (second write failed: ' +
+            String((e && e.message) || e).slice(0, 120) + ')');
+        }
       }
 
       note('info', 'create', {
@@ -3541,8 +3660,31 @@ function runShadow() {
   return summary;
 }
 
-/** The real thing. Do not install until the shadow diff is clean. */
+/**
+ * The real thing. Do not install until the shadow diff is clean.
+ *
+ * ONE RUN PER MAILBOX AT A TIME. The trigger fires every minute and a run now
+ * takes longer than that (the ledger is read whole at start, ~45 s and growing).
+ * On 21 Sep the next minute's run loaded the ledger BEFORE the previous run had
+ * flushed its rows, so the same labelled email was created twice (Ismini's
+ * "Media Campaign Assets- Hair", David's "Mon4"/"Mon5"). The user lock is per
+ * account per script project, which is exactly the unit that must not overlap:
+ * Ismini's run must not block David's, but must block Ismini's next one.
+ */
 function runLive() {
+  var userLock = LockService.getUserLock();
+  if (!userLock.tryLock(0)) {
+    console.log('runLive: previous run for this mailbox is still going; skipping this minute');
+    return { skippedOverlap: true };
+  }
+  try {
+    return runLive_();
+  } finally {
+    userLock.releaseLock();
+  }
+}
+
+function runLive_() {
   var deps = buildDeps_();
   deps.writer = createWriter_(deps);
   var summary = runIntake(deps, {});
