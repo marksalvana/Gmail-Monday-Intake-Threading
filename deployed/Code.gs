@@ -107,7 +107,7 @@ var INTEGRATION_USER_IDS = [
  * code. preflight() now prints this, so the question is a five-second check.
  * Bump it with any change worth telling apart.
  */
-var BUILD = 'intake 2026-09-14b sweep-3h+threadid-by-title+stamp-on-seed+relabel-after-unmatched+seed-on-kickoff+itemmail-sweep+clientservice-id+token-identity';
+var BUILD = 'intake 2026-09-24 sweep-3h+threadid-by-title+stamp-on-seed+relabel-after-unmatched+seed-on-kickoff+itemmail-sweep+clientservice-id+token-identity+update-subject';
 
 /**
  * The host monday gives each item as its own ingest address.
@@ -953,6 +953,7 @@ function formatUpdateBody(msg, opts) {
   // without opening Gmail. Only rendered when the intake passed them.
   if (msg.to) { head += '<br><span style="color:#676879">To: ' + escapeHtml(msg.to) + '</span>'; }
   if (msg.cc) { head += '<br><span style="color:#676879">Cc: ' + escapeHtml(msg.cc) + '</span>'; }
+  if (msg.subject) { head += '<br><span style="color:#676879">Subject: ' + escapeHtml(msg.subject) + '</span>'; }
 
   var body;
   if (msg.bodyHtml) {
@@ -2184,6 +2185,7 @@ function applyDecision(deps, ctx, summary) {
       from: msg.from,
       to: msg.to,
       cc: msg.cc,
+      subject: msg.subject,
       senderEmail: msg.senderEmail,
       bodyHtml: msg.bodyHtml,
       bodyText: msg.bodyText,
