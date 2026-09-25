@@ -44,7 +44,7 @@
 
 /** 'internal' | 'client'. THE ONLY LINE THAT DIFFERS BETWEEN THE TWO COPIES. */
 /** Which build is pasted in the editor. Printed by relayPreflight(). */
-var BUILD = 'relay 2026-09-15e grey-heading+full-width+roots-remembered+client-1min+logo+black-bg+white-card+600px-column+boxed-heading+skips-recorded+state-trim+no-re-prefix+dates-ddd-DD-MMM';
+var BUILD = 'relay 2026-09-25 grey-heading+full-width+roots-remembered+client-1min+logo+black-bg+white-card+600px-column+boxed-heading+skips-recorded+state-trim+no-re-prefix+dates-ddd-DD-MMM+outlook-heading-spacer';
 
 var ROUTE = 'internal';
 
@@ -716,12 +716,21 @@ function relayBody(a) {
   // the content. Tables and inline styles because that is the only layout
   // Gmail, Outlook and Apple Mail all agree on; Gmail strips <style> blocks.
   var head = '<table role="presentation" cellpadding="0" cellspacing="0" border="0" ' +
-    'style="width:100%;margin:0 0 20px 0;border-collapse:separate">' +
-    '<tr><td align="left" style="border-radius:6px;' +
-    'background:#f5f5f5;padding:14px 18px;font-family:Arial,Helvetica,sans-serif;' +
-    'font-size:18px;font-weight:bold;color:#222;line-height:1.3;text-align:left">' +
-    escapeHtml(a.originalSubject || '(no subject)') +
-    '</td></tr></table>';
+    // NO MARGIN ON THE TABLE. Outlook's Word renderer paints a table's bottom
+    // margin inside the cell background, so the box came out with 20px more at
+    // the bottom than the top (David, Outlook, 23 Sep). The gap below the box
+    // is a separate spacer instead. bgcolor attribute for the same renderer.
+    'style="width:100%;border-collapse:separate">' +
+    '<tr><td align="left" valign="middle" bgcolor="#f9e2d5" style="border-radius:6px;' +
+    'background:#f9e2d5;background-color:#f9e2d5;' +
+    'padding-top:20px;padding-bottom:20px;padding-left:24px;padding-right:24px;' +
+    'font-family:Arial,Helvetica,sans-serif;font-size:18px;font-weight:bold;' +
+    'color:#222;line-height:22px;mso-line-height-rule:exactly;text-align:left">' +
+    // A subject folded over two header lines arrives with CRLF + space inside
+    // it; collapsed by the browser, but trimmed here so nothing can pad the box.
+    escapeHtml(String(a.originalSubject || '(no subject)').replace(/\s+/g, ' ').trim()) +
+    '</td></tr></table>' +
+    '<div style="height:20px;line-height:20px;font-size:1px;mso-line-height-rule:exactly">&nbsp;</div>';
 
   // A real text/html part always wins — it is already markup and needs no
   // reconstruction. The opt-in only rescues the text/plain-only case, which is
