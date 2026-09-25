@@ -44,7 +44,7 @@
 
 /** 'internal' | 'client'. THE ONLY LINE THAT DIFFERS BETWEEN THE TWO COPIES. */
 /** Which build is pasted in the editor. Printed by relayPreflight(). */
-var BUILD = 'relay 2026-08-29 root-marker+cursor-safety';
+var BUILD = 'relay 2026-09-15e grey-heading+full-width+roots-remembered+client-1min+logo+black-bg+white-card+600px-column+boxed-heading+skips-recorded+state-trim+no-re-prefix+dates-ddd-DD-MMM';
 
 var ROUTE = 'internal';
 
@@ -84,9 +84,45 @@ var STATE_SPREADSHEET_IDS = {
 
 var STATE_SPREADSHEET_ID = STATE_SPREADSHEET_IDS[ROUTE] || '';
 
+/**
+ * Logo shown above the card. MUST be a public https URL: Gmail and Outlook do
+ * not render base64 data: images in mail. Empty string = no logo row.
+ */
+var LOGO_URL = 'https://group247ww.com/wp-content/uploads/2020/08/group247-logo-e1622294952207.png';
+var LOGO_WIDTH = 220;   // native 286x87; never scale up
+
 var STATE_SHEET = 'relayed';
+/** Rows kept on the state sheet. ~50 sends a day makes this about three months. */
+var STATE_MAX_ROWS = 5000;
 var STATE_HEADERS = ['ts', 'route', 'sourceMessageId', 'itemId', 'toMailbox',
   'threadId', 'subject', 'relayedMessageId', 'result', 'detail'];
+
+/**
+ * Skip reasons that get a state row, result 'skipped:<reason>'.
+ *
+ * WHY. relayHealth() looks for a sent client automation with no state row and
+ * calls it "NOT RELAYED AT ALL — the relay may not be running". Skips used to
+ * write nothing, so every deliberate skip — a kick-off root, a project with no
+ * thread, a message with no recipients — was reported as a dead relay. The 11
+ * Sep alert listed ten of them, every one a message the relay had seen and
+ * decided about. A decision that leaves no trace is indistinguishable from a
+ * relay that never ran, and that was the check's whole purpose.
+ *
+ * Only decisions about a message ON THIS ROUTE are recorded, and only terminal
+ * ones. 'other-route:*' and 'no-monday-item-address' are not this deployment's
+ * business (the internal sheet would otherwise carry a row for every client
+ * email). 'awaiting-intake-seed' is a hold, not a decision, and is re-seen
+ * every pass. 'already-relayed', 'in-flight-outcome-unknown' and 'failed-*'
+ * already have the row that caused them.
+ */
+var RECORDED_SKIPS = {
+  'item-has-no-gmail-thread': true,
+  'is-the-thread-root': true,
+  'no-recipients-in-ledger': true,
+  'ambiguous-multiple-items': true,
+  'no-item-id': true,
+  'retries-exhausted': true
+};
 
 /** off = nothing sent. on = relay. Unset means off; turning it on is deliberate. */
 var PROP_RELAY_MODE = 'G247_RELAY_MODE';
@@ -596,9 +632,19 @@ function renderAuthoredHtml(text) {
   return out.replace(/\r\n|\r|\n/g, '<br>');
 }
 
+/**
+ * The thread's subject, exactly as the root has it — no "Re:" prefix.
+ *
+ * The prefix used to be added so the copy read as a reply. It isn't needed
+ * for threading: Gmail and Outlook thread on In-Reply-To/References, and both
+ * ignore Re:/Fwd: prefixes when comparing subjects. What it did do was hand
+ * every client their first email on a project with "Re:" in front of the
+ * project name, which reads as a reply to something they never saw. The
+ * client's own reply adds the prefix naturally.
+ */
 function replySubject(subject) {
   var s = String(subject || '').trim() || '(no subject)';
-  return /^re:\s*/i.test(s) ? s : 'Re: ' + s;
+  return s.replace(/^(re|fw|fwd)\s*:\s*/i, '').trim() || '(no subject)';
 }
 
 function encodeSubject(subject, b64) {
@@ -665,15 +711,117 @@ function buildRelayMime(a, b64) {
  * PURE.
  */
 function relayBody(a) {
-  var head = '<div style="color:#666;font-size:12px;border-left:3px solid #ccc;padding-left:8px;margin-bottom:12px">' +
-    '<b>' + escapeHtml(a.originalSubject || '(no subject)') + '</b>' +
-    '</div>';
+  // ONE CENTRED 600px COLUMN, the way every transactional email is built:
+  // an outer full-width table to centre, an inner fixed-width table to hold
+  // the content. Tables and inline styles because that is the only layout
+  // Gmail, Outlook and Apple Mail all agree on; Gmail strips <style> blocks.
+  var head = '<table role="presentation" cellpadding="0" cellspacing="0" border="0" ' +
+    'style="width:100%;margin:0 0 20px 0;border-collapse:separate">' +
+    '<tr><td align="left" style="border-radius:6px;' +
+    'background:#f5f5f5;padding:14px 18px;font-family:Arial,Helvetica,sans-serif;' +
+    'font-size:18px;font-weight:bold;color:#222;line-height:1.3;text-align:left">' +
+    escapeHtml(a.originalSubject || '(no subject)') +
+    '</td></tr></table>';
+
   // A real text/html part always wins — it is already markup and needs no
   // reconstruction. The opt-in only rescues the text/plain-only case, which is
   // every message monday actually sends.
-  if (a.html) { return head + a.html; }
-  if (a.htmlOptIn) { return head + renderAuthoredHtml(a.text || ''); }
-  return head + '<pre style="white-space:pre-wrap">' + escapeHtml(a.text || '') + '</pre>';
+  var body;
+  if (a.html) { body = a.html; }
+  else if (a.htmlOptIn) { body = renderAuthoredHtml(a.text || ''); }
+  else { body = '<pre style="white-space:pre-wrap">' + escapeHtml(a.text || '') + '</pre>'; }
+
+  // No logo, no dark frame, no card border — Mark's call on 15 Sep. The
+  // heading box is the one piece of styling that stays. LOGO_URL is kept so
+  // it can come back with a one-line change.
+  var logo = '';
+
+  // Full width, left-aligned, like an ordinary email. The only styled element
+  // is the heading box.
+  return '<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;color:#222;line-height:1.5">' +
+    head + body + '</div>';
+}
+
+// ================================================================= DATES
+
+/**
+ * DATES READ AS "ddd DD MMM", e.g. "Thu 24 Sep". Mark's call, 23 Sep 2026:
+ * strictly that, no year, ever.
+ *
+ * WHERE. monday writes a date chip out in whatever format the automation
+ * creator's account uses ("24 September 2026" on the 23 Sep kick-off), so the
+ * only place every automation passes through is here.
+ *
+ * WHAT IS REWRITTEN. Only dates that carry a year, because the weekday cannot
+ * be worked out without one:
+ *   24 September 2026 / 24 Sep 2026 / 24th Sep, 2026
+ *   September 24, 2026 / Sep 24 2026
+ *   2026-09-24
+ * A weekday already in front ("Thursday, 24 September 2026") is absorbed, so
+ * it never reads "Thursday, Thu 24 Sep".
+ *
+ * WHAT IS LEFT ALONE, deliberately:
+ *   24/09/2026, 09/24/2026  ambiguous: 24 Sep or 9 Dec? A wrong date sent to a
+ *                           client is worse than an ugly one.
+ *   24 September            no year, so no weekday.
+ *   31 February 2026        not a real date; shown as written.
+ *   anything inside a tag   an href or attribute is never touched, so links
+ *                           that contain dates keep working.
+ *   2026-09-16 1557         a Drive round-folder name, not a date.
+ *   the thread subject      Gmail threads on it; only the heading is changed.
+ * PURE.
+ */
+var DATE_MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+var DATE_MON_OUT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+var DATE_DAY_OUT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+var DATE_WD = '(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\\.?,?\\s+)?';
+var DATE_MON = '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|' +
+  'july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)' +
+  '(?![a-z])\\.?';
+var DATE_DD = '(\\d{1,2})(?:st|nd|rd|th)?';
+
+var DATE_RE_DMY = new RegExp('\\b' + DATE_WD + DATE_DD + '\\s+' + DATE_MON +
+  ',?\\s+(\\d{4})(?!\\d)', 'gi');
+var DATE_RE_MDY = new RegExp('\\b' + DATE_WD + DATE_MON + '\\s+' + DATE_DD +
+  ',?\\s+(\\d{4})(?!\\d)', 'gi');
+var DATE_RE_ISO = /(?<![\w\/.:=?&#-])(\d{4})-(\d{2})-(\d{2})(?![\w\/-]|T\d|\s+\d{3,4}(?!\d))/g;
+
+/** "Thu 24 Sep", or null when y/m/d is not a real date. PURE. */
+function shortDate(y, m, d) {
+  var dt = new Date(Date.UTC(y, m, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m || dt.getUTCDate() !== d) {
+    return null;
+  }
+  return DATE_DAY_OUT[dt.getUTCDay()] + ' ' + (d < 10 ? '0' : '') + d + ' ' + DATE_MON_OUT[m];
+}
+
+/** Rewrite the dates in a run of text that contains no markup. PURE. */
+function formatDatesInText(s) {
+  return String(s)
+    .replace(DATE_RE_DMY, function (all, d, mon, y) {
+      return shortDate(+y, DATE_MONTHS[mon.slice(0, 3).toLowerCase()], +d) || all;
+    })
+    .replace(DATE_RE_MDY, function (all, mon, d, y) {
+      return shortDate(+y, DATE_MONTHS[mon.slice(0, 3).toLowerCase()], +d) || all;
+    })
+    .replace(DATE_RE_ISO, function (all, y, m, d) {
+      return shortDate(+y, +m - 1, +d) || all;
+    });
+}
+
+/**
+ * Same, for a body that may contain markup: only the text BETWEEN tags is
+ * touched, so an href or attribute holding a date is never rewritten.
+ * PURE.
+ */
+function formatDates(body) {
+  if (body === null || body === undefined || body === '') { return body; }
+  return String(body).split(/(<[^>]*>)/).map(function (part) {
+    return part.charAt(0) === '<' ? part : formatDatesInText(part);
+  }).join('');
 }
 
 // =============================================================== RATE LIMIT
@@ -826,7 +974,7 @@ function shouldRelay(m, ctx) {
  * @param {number} nowMs
  */
 function healthCheck(rows, markerMsgs, nowMs) {
-  var out = { ok: true, checkedRows: 0, checkedMessages: 0, stuck: [], lost: [] };
+  var out = { ok: true, checkedRows: 0, checkedMessages: 0, stuck: [], lost: [], skipped: {} };
   var bySource = {};
 
   (rows || []).forEach(function (r) {
@@ -840,6 +988,14 @@ function healthCheck(rows, markerMsgs, nowMs) {
   Object.keys(bySource).forEach(function (id) {
     var res = bySource[id];
     if (res === 'sent' || res === 'sent-self') { return; }
+    // A recorded skip is a decision, not a failure: the relay ran, looked, and
+    // chose not to send. Counted so the report can say so, never "stuck".
+    if (res === 'root-seen') { return; }
+    if (res.indexOf('skipped:') === 0) {
+      var why = res.slice('skipped:'.length);
+      out.skipped[why] = (out.skipped[why] || 0) + 1;
+      return;
+    }
     out.stuck.push({ sourceMessageId: id, result: res || '(blank)' });
   });
 
@@ -858,11 +1014,17 @@ function healthCheck(rows, markerMsgs, nowMs) {
 
 /** Format a health report as something a human reads at 8am. PURE. */
 function healthMessage(h) {
+  var skips = Object.keys(h.skipped || {}).map(function (k) {
+    return h.skipped[k] + ' x ' + k;
+  });
+  var skipLine = skips.length
+    ? ' Deliberately skipped: ' + skips.join(', ') + ' (see the state sheet).' : '';
   if (h.ok) {
     return 'Client relay healthy. ' + h.checkedRows + ' relayed message(s) on record, ' +
-      h.checkedMessages + ' client automation(s) seen, none unaccounted for.';
+      h.checkedMessages + ' client automation(s) seen, none unaccounted for.' + skipLine;
   }
   var out = ['CLIENT RELAY NEEDS ATTENTION.', ''];
+  if (skipLine) { out.push(skipLine.trim(), ''); }
   if (h.lost.length) {
     out.push('NOT RELAYED AT ALL — a client automation was sent and this script ' +
       'never recorded it. The relay may not be running:');
@@ -904,12 +1066,24 @@ function healthMessage(h) {
  * is about to anchor waits with it, and they are released together.
  * PURE.
  */
-function itemsAwaitingRoot(metas, nowMs, graceMs) {
+function itemsAwaitingRoot(metas, nowMs, graceMs, rememberedRoots) {
   var out = {};
   (metas || []).forEach(function (m) {
     if (!m || !m.ok || m.rootMarker !== true) { return; }
     if (!m.internalDate || (nowMs - m.internalDate) >= graceMs) { return; }
     extractPulseItemIds(m.addresses).forEach(function (id) { out[String(id)] = true; });
+  });
+  // ROOTS SEEN ON AN EARLIER PASS. At a 1-minute poll the root and the client
+  // half usually land in DIFFERENT passes: the root at :39, the client half at
+  // :41 after the PM flips the column. On 14 Sep (P261483) the client half was
+  // read alone, nothing in its batch carried the marker, and it was dropped as
+  // 'item-has-no-gmail-thread' twelve seconds before the intake rooted the
+  // project. The state sheet now remembers each root it has seen, and a young
+  // one counts here exactly as if it were in the batch.
+  (rememberedRoots || []).forEach(function (r) {
+    if (!r || !r.itemId || !r.ts) { return; }
+    if ((nowMs - r.ts) >= graceMs) { return; }
+    out[String(r.itemId)] = true;
   });
   return out;
 }
@@ -990,7 +1164,22 @@ function runRelayPass(deps, opts) {
   for (var f = 0; f < ids.length && f < MAX_BATCH; f++) {
     metas.push(deps.gmail.messageMeta(ids[f]));
   }
-  var awaitingRoot = itemsAwaitingRoot(metas, deps.nowMs(), SEED_GRACE_MS);
+  // Remember every root in this batch before deciding anything, so the client
+  // half — this pass or a later one — can wait for it. Once per root.
+  metas.forEach(function (m) {
+    if (!m || !m.ok || m.rootMarker !== true) { return; }
+    var prior = deps.store.attemptsFor(m.id);
+    if (prior && prior.last === 'root-seen') { return; }
+    var rootItems = extractPulseItemIds(m.addresses);
+    if (!rootItems.length) { return; }
+    deps.store.record({
+      ts: deps.now(), route: ROUTE, sourceMessageId: m.id, itemId: rootItems[0],
+      toMailbox: '', threadId: '', subject: m.subject, relayedMessageId: '',
+      result: 'root-seen', detail: ''
+    });
+  });
+  var remembered = deps.store.recentRoots ? deps.store.recentRoots() : [];
+  var awaitingRoot = itemsAwaitingRoot(metas, deps.nowMs(), SEED_GRACE_MS, remembered);
 
   for (var i = 0; i < metas.length; i++) {
     var m = metas[i];
@@ -1019,7 +1208,24 @@ function runRelayPass(deps, opts) {
       continue;
     }
 
-    if (!verdict.relay) { note(verdict.reason); continue; }
+    if (!verdict.relay) {
+      note(verdict.reason);
+      if (RECORDED_SKIPS[verdict.reason] === true) {
+        // ONCE per message and reason: a re-read window must not append the
+        // same skip again, and a later real send must still be possible —
+        // shouldRelay() only reacts to 'sent', 'sending' and 'FAILED'.
+        var priorSkip = deps.store.attemptsFor(m.id);
+        if (!priorSkip || priorSkip.last !== 'skipped:' + verdict.reason) {
+          deps.store.record({
+            ts: deps.now(), route: ROUTE, sourceMessageId: m.id,
+            itemId: verdict.itemId || '', toMailbox: '', threadId: '',
+            subject: m.subject, relayedMessageId: '',
+            result: 'skipped:' + verdict.reason, detail: ''
+          });
+        }
+      }
+      continue;
+    }
 
     var isClient = (ROUTE === 'client');
     var cap = isClient ? CLIENT_MAX_PER_HOUR : RELAY_MAX_PER_HOUR;
@@ -1058,7 +1264,7 @@ function runRelayPass(deps, opts) {
       itemId: verdict.itemId,
       route: ROUTE,
       sourceMessageId: m.id,
-      originalSubject: m.subject,
+      originalSubject: formatDates(m.subject),
       sentTo: (ROUTE === 'client' ? (verdict.outsiders || []) :
         (m.addresses || []).filter(function (a) {
           return !/pulse-\d+@/i.test(a) &&
@@ -1067,8 +1273,8 @@ function runRelayPass(deps, opts) {
       // STRIPPED. The routing line is plumbing and names the whole
       // distribution; the client must never see it, and a sent mail cannot be
       // recalled.
-      html: stripRelayPlumbing(m.bodyHtml),
-      text: stripRelayPlumbing(m.bodyText),
+      html: formatDates(stripRelayPlumbing(m.bodyHtml)),
+      text: formatDates(stripRelayPlumbing(m.bodyText)),
       htmlOptIn: m.htmlOptIn === true
     }, deps.b64);
 
@@ -1192,27 +1398,44 @@ function gmailService_() {
 
     /** Message ids that appeared since the cursor. SENT mail included. */
     historyList: function (startHistoryId) {
-      var res = Gmail.Users.History.list('me', { startHistoryId: String(startHistoryId) });
+      // FOLLOW EVERY PAGE. Gmail's history is paginated and a page can contain
+      // history records with no SENT message in it (label changes, inbound
+      // mail). Reading only the first page and then holding the cursor because
+      // there was "more" deadlocked the relay for 34 hours on 18-19 Sep 2026:
+      // 0 seen, more pages pending, every minute, forever. labelId and
+      // historyTypes make Gmail drop the noise server-side; the loop handles
+      // whatever noise remains. hasMore is true only when the batch cap stopped
+      // us, which is the one case the caller must hold the cursor for.
       var ids = [];
       var seen = {};
-      ((res && res.history) || []).forEach(function (h) {
-        (h.messagesAdded || []).forEach(function (a) {
-          var msg = a.message;
-          if (!msg || !msg.id) { return; }
-          var labels = msg.labelIds || [];
-          // Only what THIS mailbox sent, which is where monday's automation
-          // copies land. Drafts and inbound mail are not ours to relay.
-          if (labels.indexOf('SENT') === -1) { return; }
-          if (labels.indexOf('DRAFT') !== -1 || labels.indexOf('TRASH') !== -1) { return; }
-          if (!seen[msg.id]) { seen[msg.id] = true; ids.push(msg.id); }
+      var token = null;
+      var pages = 0;
+      var newest = '';
+      do {
+        var params = { startHistoryId: String(startHistoryId),
+                       historyTypes: ['messageAdded'], labelId: 'SENT', maxResults: 500 };
+        if (token) { params.pageToken = token; }
+        var res = Gmail.Users.History.list('me', params);
+        ((res && res.history) || []).forEach(function (h) {
+          (h.messagesAdded || []).forEach(function (a) {
+            var msg = a.message;
+            if (!msg || !msg.id) { return; }
+            var labels = msg.labelIds || [];
+            // Only what THIS mailbox sent, which is where monday's automation
+            // copies land. Drafts and inbound mail are not ours to relay.
+            if (labels.indexOf('SENT') === -1) { return; }
+            if (labels.indexOf('DRAFT') !== -1 || labels.indexOf('TRASH') !== -1) { return; }
+            if (!seen[msg.id]) { seen[msg.id] = true; ids.push(msg.id); }
+          });
         });
-      });
+        if (res && res.historyId) { newest = String(res.historyId); }
+        token = res && res.nextPageToken;
+        pages++;
+      } while (token && ids.length < MAX_BATCH && pages < 20);
       return {
         messageIds: ids,
-        newHistoryId: res && res.historyId ? String(res.historyId) : '',
-        // Gmail paginates history. Ignoring this silently truncated any backlog
-        // bigger than one page and then advanced the cursor past the remainder.
-        hasMore: !!(res && res.nextPageToken)
+        newHistoryId: newest,
+        hasMore: !!token
       };
     },
 
@@ -1341,11 +1564,14 @@ function relayStore_() {
     }
     return sh;
   }
+  var roots = null;   // [{itemId, ts}] for every 'root-seen' row, filled with the cache
   function loaded() {
     if (cache) { return cache; }
     cache = {};
+    roots = [];
     var values = sheet().getDataRange().getValues();
     var ri = STATE_HEADERS.indexOf('result');
+    var ii = STATE_HEADERS.indexOf('itemId');
     for (var r = 1; r < values.length; r++) {
       var k = String(values[r][2]);
       var res = String(values[r][ri] || '');
@@ -1353,6 +1579,9 @@ function relayStore_() {
       a.last = res;
       if (res === 'FAILED') { a.failures++; }
       cache[k] = a;
+      if (res === 'root-seen') {
+        roots.push({ itemId: String(values[r][ii] || ''), ts: Date.parse(String(values[r][0])) || 0 });
+      }
     }
     return cache;
   }
@@ -1371,9 +1600,25 @@ function relayStore_() {
       return loaded()[String(sourceMessageId)] || null;
     },
 
+    /** Roots this deployment has seen, newest state-sheet rows included. */
+    recentRoots: function () {
+      loaded();
+      return roots.slice();
+    },
+
     record: function (rec) {
       var sh = sheet();
       sh.appendRow(STATE_HEADERS.map(function (h) { return rec[h] === undefined ? '' : rec[h]; }));
+      if (String(rec.result) === 'root-seen') {
+        loaded();
+        roots.push({ itemId: String(rec.itemId || ''), ts: Date.parse(String(rec.ts)) || Date.now() });
+      }
+      // KEEP THE SHEET BOUNDED. Every pass reads the whole sheet, so it must not
+      // grow forever. Rows only matter while their message can still be
+      // re-read from history (days), so the oldest can go once there are far
+      // more than that. Oldest-first: the sheet is append-ordered by ts.
+      var excess = sh.getLastRow() - 1 - STATE_MAX_ROWS;
+      if (excess > 0) { sh.deleteRows(2, excess); }
       var k = String(rec.sourceMessageId);
       var a = loaded()[k] || { last: '', failures: 0 };
       a.last = String(rec.result || '');
@@ -1436,8 +1681,32 @@ function installRelayTrigger() {
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (t.getHandlerFunction() === 'relayRun') { ScriptApp.deleteTrigger(t); }
   });
-  ScriptApp.newTrigger('relayRun').timeBased().everyMinutes(5).create();
-  return 'relayRun installed at 5-minute intervals';
+  // CLIENT RUNS EVERY MINUTE; INTERNAL EVERY FIVE.
+  //
+  // A client waits on the client relay: the kick-off and every approval reach
+  // them only after this pass finds the message, and at 5 minutes the gap
+  // between the root email and the kick-off was the visible cost (14:03 vs
+  // 14:08 on 14 Sep). The floor is the intake's own 1-minute poll plus this
+  // one, so about two minutes worst case. Anything faster needs Gmail push
+  // notifications and a Cloud project, which is not worth it for a poll.
+  //
+  // Both relays run as projects@ and share ONE Apps Script quota: 6 hours of
+  // trigger runtime a day on Workspace. A quiet pass is a few seconds, so
+  // 1-minute on client alone is well inside that; 1-minute on both would be
+  // near the line for no client-visible benefit.
+  var every = (ROUTE === 'client') ? 1 : 5;
+  ScriptApp.newTrigger('relayRun').timeBased().everyMinutes(every).create();
+  return 'relayRun installed at ' + every + '-minute intervals (' + ROUTE + ')';
+}
+
+/**
+ * One-off: forget the cursor so the NEXT relayRun seeds at the current history
+ * id and relays nothing. Use when a backlog must be skipped rather than
+ * replayed (e.g. after the 18-19 Sep 2026 pagination deadlock). Run as projects@.
+ */
+function relayReseedCursorNow() {
+  PropertiesService.getUserProperties().deleteProperty(CURSOR_KEY);
+  return 'cursor cleared; next relayRun seeds at the current history id and relays nothing';
 }
 
 function removeRelayTriggers() {

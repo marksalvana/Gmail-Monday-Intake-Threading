@@ -44,7 +44,7 @@
 
 /** 'internal' | 'client'. THE ONLY LINE THAT DIFFERS BETWEEN THE TWO COPIES. */
 /** Which build is pasted in the editor. Printed by relayPreflight(). */
-var BUILD = 'relay 2026-09-15e grey-heading+full-width+roots-remembered+client-1min+logo+black-bg+white-card+600px-column+boxed-heading+skips-recorded+state-trim+no-re-prefix';
+var BUILD = 'relay 2026-09-15e grey-heading+full-width+roots-remembered+client-1min+logo+black-bg+white-card+600px-column+boxed-heading+skips-recorded+state-trim+no-re-prefix+dates-ddd-DD-MMM';
 
 var ROUTE = 'client';
 
@@ -746,6 +746,88 @@ function relayBody(a) {
     head + body + '</div>';
 }
 
+// ================================================================= DATES
+
+/**
+ * DATES READ AS "ddd DD MMM", e.g. "Thu 24 Sep". Mark's call, 23 Sep 2026:
+ * strictly that, no year, ever.
+ *
+ * WHERE. monday writes a date chip out in whatever format the automation
+ * creator's account uses ("24 September 2026" on the 23 Sep kick-off), so the
+ * only place every automation passes through is here.
+ *
+ * WHAT IS REWRITTEN. Only dates that carry a year, because the weekday cannot
+ * be worked out without one:
+ *   24 September 2026 / 24 Sep 2026 / 24th Sep, 2026
+ *   September 24, 2026 / Sep 24 2026
+ *   2026-09-24
+ * A weekday already in front ("Thursday, 24 September 2026") is absorbed, so
+ * it never reads "Thursday, Thu 24 Sep".
+ *
+ * WHAT IS LEFT ALONE, deliberately:
+ *   24/09/2026, 09/24/2026  ambiguous: 24 Sep or 9 Dec? A wrong date sent to a
+ *                           client is worse than an ugly one.
+ *   24 September            no year, so no weekday.
+ *   31 February 2026        not a real date; shown as written.
+ *   anything inside a tag   an href or attribute is never touched, so links
+ *                           that contain dates keep working.
+ *   2026-09-16 1557         a Drive round-folder name, not a date.
+ *   the thread subject      Gmail threads on it; only the heading is changed.
+ * PURE.
+ */
+var DATE_MONTHS = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+var DATE_MON_OUT = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+var DATE_DAY_OUT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+var DATE_WD = '(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\\.?,?\\s+)?';
+var DATE_MON = '(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|' +
+  'july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)' +
+  '(?![a-z])\\.?';
+var DATE_DD = '(\\d{1,2})(?:st|nd|rd|th)?';
+
+var DATE_RE_DMY = new RegExp('\\b' + DATE_WD + DATE_DD + '\\s+' + DATE_MON +
+  ',?\\s+(\\d{4})(?!\\d)', 'gi');
+var DATE_RE_MDY = new RegExp('\\b' + DATE_WD + DATE_MON + '\\s+' + DATE_DD +
+  ',?\\s+(\\d{4})(?!\\d)', 'gi');
+var DATE_RE_ISO = /(?<![\w\/.:=?&#-])(\d{4})-(\d{2})-(\d{2})(?![\w\/-]|T\d|\s+\d{3,4}(?!\d))/g;
+
+/** "Thu 24 Sep", or null when y/m/d is not a real date. PURE. */
+function shortDate(y, m, d) {
+  var dt = new Date(Date.UTC(y, m, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m || dt.getUTCDate() !== d) {
+    return null;
+  }
+  return DATE_DAY_OUT[dt.getUTCDay()] + ' ' + (d < 10 ? '0' : '') + d + ' ' + DATE_MON_OUT[m];
+}
+
+/** Rewrite the dates in a run of text that contains no markup. PURE. */
+function formatDatesInText(s) {
+  return String(s)
+    .replace(DATE_RE_DMY, function (all, d, mon, y) {
+      return shortDate(+y, DATE_MONTHS[mon.slice(0, 3).toLowerCase()], +d) || all;
+    })
+    .replace(DATE_RE_MDY, function (all, mon, d, y) {
+      return shortDate(+y, DATE_MONTHS[mon.slice(0, 3).toLowerCase()], +d) || all;
+    })
+    .replace(DATE_RE_ISO, function (all, y, m, d) {
+      return shortDate(+y, +m - 1, +d) || all;
+    });
+}
+
+/**
+ * Same, for a body that may contain markup: only the text BETWEEN tags is
+ * touched, so an href or attribute holding a date is never rewritten.
+ * PURE.
+ */
+function formatDates(body) {
+  if (body === null || body === undefined || body === '') { return body; }
+  return String(body).split(/(<[^>]*>)/).map(function (part) {
+    return part.charAt(0) === '<' ? part : formatDatesInText(part);
+  }).join('');
+}
+
 // =============================================================== RATE LIMIT
 
 function relayRateGate(store, nowMs, limit, windowMs, key) {
@@ -1186,7 +1268,7 @@ function runRelayPass(deps, opts) {
       itemId: verdict.itemId,
       route: ROUTE,
       sourceMessageId: m.id,
-      originalSubject: m.subject,
+      originalSubject: formatDates(m.subject),
       sentTo: (ROUTE === 'client' ? (verdict.outsiders || []) :
         (m.addresses || []).filter(function (a) {
           return !/pulse-\d+@/i.test(a) &&
@@ -1195,8 +1277,8 @@ function runRelayPass(deps, opts) {
       // STRIPPED. The routing line is plumbing and names the whole
       // distribution; the client must never see it, and a sent mail cannot be
       // recalled.
-      html: stripRelayPlumbing(m.bodyHtml),
-      text: stripRelayPlumbing(m.bodyText),
+      html: formatDates(stripRelayPlumbing(m.bodyHtml)),
+      text: formatDates(stripRelayPlumbing(m.bodyText)),
       htmlOptIn: m.htmlOptIn === true
     }, deps.b64);
 
