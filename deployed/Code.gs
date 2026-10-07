@@ -107,7 +107,7 @@ var INTEGRATION_USER_IDS = [
  * code. preflight() now prints this, so the question is a five-second check.
  * Bump it with any change worth telling apart.
  */
-var BUILD = 'intake 2026-09-24 sweep-3h+threadid-by-title+stamp-on-seed+relabel-after-unmatched+seed-on-kickoff+itemmail-sweep+clientservice-id+token-identity+update-subject';
+var BUILD = 'intake 2026-09-24 sweep-3h+threadid-by-title+stamp-on-seed+relabel-after-unmatched+seed-on-kickoff+itemmail-sweep+clientservice-id+token-identity+update-subject+client-from-to';
 
 /**
  * The host monday gives each item as its own ingest address.
@@ -2532,7 +2532,7 @@ function createGmailService() {
         references: header(payload, 'References'),
         inReplyTo: header(payload, 'In-Reply-To'),
         from: from,
-        senderEmail: firstAddress(from),
+        senderEmail: clientAddressFrom(from, header(payload, 'To'), header(payload, 'Cc')),
         to: header(payload, 'To'),
         cc: header(payload, 'Cc'),
         subject: header(payload, 'Subject'),
@@ -3983,6 +3983,36 @@ function isReachableClientAddress(addr) {
   return true;
 }
 
+/**
+ * Which address is THE CLIENT on this message?
+ *
+ * The sender, unless the sender is one of us. Mail we originate — the Fillout
+ * receipt from projects@, a PM writing to a client with a colleague copied —
+ * carries the client in To or Cc, not From. In that case the first address
+ * that is an outside human (isReachableClientAddress: not our domain, not a
+ * pulse address, not a no-reply) wins, To before Cc, left to right.
+ *
+ * Falls back to the sender when nothing external is on the message, so
+ * internal-only mail behaves exactly as before this change.
+ * PURE.
+ */
+function clientAddressFrom(from, to, cc) {
+  var re = /[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}/gi;
+  function first(v) {
+    var m = String(v || '').match(re);
+    return m && m.length ? m[0].toLowerCase() : '';
+  }
+  var sender = first(from);
+  if (!sender || isReachableClientAddress(sender)) { return sender; }
+
+  var all = (String(to || '').match(re) || []).concat(String(cc || '').match(re) || []);
+  for (var i = 0; i < all.length; i++) {
+    var a = all[i].toLowerCase();
+    if (isReachableClientAddress(a)) { return a; }
+  }
+  return sender;
+}
+
 function participantsAudit() {
   var sh = SpreadsheetApp.openById(LEDGER_SPREADSHEET_ID).getSheetByName(LEDGER_SHEET);
   if (!sh) { throw new Error('ledger sheet not found'); }
@@ -4336,7 +4366,7 @@ var EXPECTED_SYMBOLS = [
   ['35_UpdateBody.gs', ['toMondayDateTime', 'formatUpdateBody', 'escapeHtml']],
   ['40_Store.gs', ['createLedger', 'normalizeMessageId', 'bareMessageId',
     'collectParticipants', 'LEDGER_HEADERS', 'backfillParticipants',
-    'participantsAudit', 'isReachableClientAddress']],
+    'participantsAudit', 'isReachableClientAddress', 'clientAddressFrom']],
   ['45_RunLog.gs', ['createRunLog', 'RUNLOG_HEADERS']],
   ['50_SheetAdapter.gs', ['createSheetAdapter']],
   ['55_Migration.gs', ['importMakeLedger', 'previewMakeLedgerImport',
